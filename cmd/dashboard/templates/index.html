@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redis Queue Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .connection-status {
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 0.9em;
+        }
+        .connection-status.connected {
+            color: #90EE90;
+        }
+        .connection-status.disconnected {
+            color: #FFB6C1;
+        }
+        .queues-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .queue-card {
+            background: white;
+            border-radius: 16px;
+            padding: 25px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 3px solid transparent;
+        }
+        .queue-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 50px rgba(0,0,0,0.15);
+        }
+        .queue-card.selected {
+            border-color: #667eea;
+            box-shadow: 0 15px 50px rgba(102,126,234,0.3);
+        }
+        .queue-name {
+            font-size: 1.5em;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .queue-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2em;
+        }
+        .queue-icon.email {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        .queue-icon.download {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+        .queue-info {
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 15px;
+        }
+        .queue-size {
+            display: flex;
+            align-items: baseline;
+            gap: 5px;
+        }
+        .queue-size .count {
+            font-size: 2.5em;
+            font-weight: 700;
+            color: #667eea;
+            transition: all 0.3s ease;
+        }
+        .queue-size .count.updated {
+            transform: scale(1.1);
+            color: #764ba2;
+        }
+        .queue-size .label {
+            color: #888;
+            font-size: 0.9em;
+        }
+        .jobs-panel {
+            background: white;
+            border-radius: 16px;
+            padding: 25px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            display: none;
+        }
+        .jobs-panel.visible {
+            display: block;
+        }
+        .jobs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        .jobs-title {
+            font-size: 1.3em;
+            font-weight: 600;
+            color: #333;
+        }
+        .refresh-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: transform 0.2s;
+        }
+        .refresh-btn:hover {
+            transform: scale(1.05);
+        }
+        .jobs-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .job-item {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+        }
+        .job-item.has-error {
+            border-left-color: #f5576c;
+            background: #fff5f5;
+        }
+        .job-id {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.85em;
+            color: #667eea;
+            margin-bottom: 8px;
+        }
+        .job-item.has-error .job-id {
+            color: #f5576c;
+        }
+        .job-payload {
+            background: #fff;
+            border-radius: 6px;
+            padding: 10px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.8em;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        .error-badge {
+            display: inline-block;
+            background: #f5576c;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            margin-left: 8px;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
+        .empty-state-icon {
+            font-size: 3em;
+            margin-bottom: 15px;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .loading {
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Redis Queue Dashboard</h1>
+        <div class="connection-status" id="connectionStatus">
+            <span id="statusIndicator">🔴 Disconnected</span>
+        </div>
+        
+        <div class="queues-grid" id="queuesGrid">
+            {{range .Queues}}
+            <div class="queue-card" data-queue="{{.Name}}" onclick="selectQueue('{{.Name}}')">
+                <div class="queue-name">
+                    <div class="queue-icon {{.Name}}">{{if eq .Name "email"}}📧{{else if eq .Name "download"}}📥{{else}}📋{{end}}</div>
+                    <span>{{.Name}}</span>
+                </div>
+                <div class="queue-info">
+                    Queue: <code>{{.QueueName}}</code>
+                </div>
+                <div class="queue-size">
+                    <span class="count" id="size-{{.Name}}">{{.Size}}</span>
+                    <span class="label">pending jobs</span>
+                </div>
+            </div>
+            {{end}}
+        </div>
+
+        <div class="jobs-panel" id="jobsPanel">
+            <div class="jobs-header">
+                <div class="jobs-title">
+                    <span id="jobsPanelTitle">Pending Jobs</span>
+                </div>
+                <button class="refresh-btn" onclick="refreshJobs()">🔄 Refresh</button>
+            </div>
+            <div class="jobs-list" id="jobsList">
+                <div class="empty-state">
+                    <div class="empty-state-icon">📭</div>
+                    <div>No jobs in queue</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedQueue = null;
+        let eventSource = null;
+        let previousSizes = {};
+
+        // Connect to SSE endpoint
+        function connectSSE() {
+            eventSource = new EventSource('/events');
+            
+            eventSource.onopen = function() {
+                document.getElementById('statusIndicator').innerHTML = '🟢 Connected (real-time)';
+                document.getElementById('connectionStatus').className = 'connection-status connected';
+            };
+            
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                updateQueues(data.queues);
+            };
+            
+            eventSource.onerror = function() {
+                document.getElementById('statusIndicator').innerHTML = '🔴 Disconnected - Reconnecting...';
+                document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                
+                // Attempt to reconnect after 3 seconds
+                setTimeout(function() {
+                    if (eventSource) {
+                        eventSource.close();
+                    }
+                    connectSSE();
+                }, 3000);
+            };
+        }
+
+        function updateQueues(queues) {
+            queues.forEach(queue => {
+                const sizeEl = document.getElementById(`size-${queue.name}`);
+                if (sizeEl) {
+                    const newSize = queue.size;
+                    const oldSize = previousSizes[queue.name];
+                    
+                    // Animate if size changed
+                    if (oldSize !== undefined && oldSize !== newSize) {
+                        sizeEl.classList.add('updated');
+                        setTimeout(() => sizeEl.classList.remove('updated'), 300);
+                    }
+                    
+                    sizeEl.textContent = newSize;
+                    previousSizes[queue.name] = newSize;
+                }
+            });
+            
+            // Also refresh jobs list if a queue is selected
+            if (selectedQueue) {
+                fetchJobs(selectedQueue);
+            }
+        }
+
+        async function fetchJobs(queueName) {
+            try {
+                const response = await fetch(`/api/queue/${queueName}`);
+                const jobs = await response.json();
+                
+                const jobsList = document.getElementById('jobsList');
+                
+                if (jobs.length === 0) {
+                    jobsList.innerHTML = `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📭</div>
+                            <div>No jobs in queue</div>
+                        </div>
+                    `;
+                    return;
+                }
+
+                jobsList.innerHTML = jobs.map(job => {
+                    const hasError = job.payload && job.payload.to && job.payload.to.toLowerCase().includes('error');
+                    const errorBadge = hasError ? '<span class="error-badge">Will Fail</span>' : '';
+                    return `
+                        <div class="job-item ${hasError ? 'has-error' : ''}">
+                            <div class="job-id">ID: ${job.id}${errorBadge}</div>
+                            <div class="job-payload">${JSON.stringify(job.payload, null, 2)}</div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (error) {
+                console.error('Failed to fetch jobs:', error);
+            }
+        }
+
+        function selectQueue(queueName) {
+            // Update selected state
+            document.querySelectorAll('.queue-card').forEach(card => {
+                card.classList.remove('selected');
+            });
+            document.querySelector(`.queue-card[data-queue="${queueName}"]`).classList.add('selected');
+            
+            selectedQueue = queueName;
+            document.getElementById('jobsPanel').classList.add('visible');
+            document.getElementById('jobsPanelTitle').textContent = `Pending Jobs - ${queueName}`;
+            
+            fetchJobs(queueName);
+        }
+
+        function refreshJobs() {
+            if (selectedQueue) {
+                fetchJobs(selectedQueue);
+            }
+        }
+
+        // Initialize SSE connection
+        connectSSE();
+    </script>
+</body>
+</html>
