@@ -2,6 +2,7 @@ package redisqueue
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -12,21 +13,23 @@ import (
 
 // WorkerConfig holds configuration for a worker.
 type WorkerConfig struct {
-	Concurrency   int           // Number of concurrent goroutines per job type
-	PollInterval  time.Duration // Interval between polling attempts
-	RetryOnErr    bool          // Whether to retry failed jobs
-	RetryDelay    time.Duration // Delay before retrying a failed job
-	MaxRetries    int           // Maximum number of retries for failed jobs
+	Concurrency    int           // Number of concurrent goroutines per job type
+	PollInterval   time.Duration // Interval between polling attempts
+	RetryOnErr     bool          // Whether to retry failed jobs
+	RetryDelay     time.Duration // Delay before retrying a failed job
+	MaxRetries     int           // Maximum number of retries for failed jobs
+	DelayBatchSize int64         // Max jobs to promote from delayed queue per tick
 }
 
 // DefaultWorkerConfig returns a WorkerConfig with sensible defaults.
 func DefaultWorkerConfig() WorkerConfig {
 	return WorkerConfig{
-		Concurrency:  1,
-		PollInterval: 100 * time.Millisecond,
-		RetryOnErr:   false,
-		RetryDelay:   1 * time.Second,
-		MaxRetries:   3,
+		Concurrency:    1,
+		PollInterval:   100 * time.Millisecond,
+		RetryOnErr:     false,
+		RetryDelay:     1 * time.Second,
+		MaxRetries:     3,
+		DelayBatchSize: 50,
 	}
 }
 
@@ -73,6 +76,8 @@ func (w *Worker) Start(ctx context.Context, jobTypes ...string) {
 			workerID := i + 1
 			go w.run(ctx, jt, workerID)
 		}
+		w.wg.Add(1)
+		go w.promoteDelayed(ctx, jt)
 		log.Printf("Started %d concurrent worker(s) for job type %q", w.config.Concurrency, jt)
 	}
 }
@@ -111,43 +116,133 @@ func (w *Worker) run(ctx context.Context, jobType string, workerID int) {
 			}
 
 			// Process the job with optional retry
-			w.processWithRetry(ctx, job, handler, workerID)
+			w.processWithRetry(ctx, job, handler, queue, workerID)
 		}
 	}
 }
 
 // processWithRetry processes a job with optional retry logic.
-func (w *Worker) processWithRetry(ctx context.Context, job *Job, handler Handler, workerID int) {
-	var lastErr error
-	attempts := 0
-	maxAttempts := 1
-	if w.config.RetryOnErr {
-		maxAttempts = w.config.MaxRetries + 1
+func (w *Worker) processWithRetry(ctx context.Context, job *Job, handler Handler, queue *JobQueue, workerID int) {
+	maxAttempts := w.config.MaxRetries
+	if maxAttempts < 1 {
+		maxAttempts = 1
 	}
 
-	for attempts < maxAttempts {
-		attempts++
-		err := handler.Handle(ctx, job)
-		if err == nil {
-			log.Printf("[Worker-%d] successfully processed job %s (type: %s)", workerID, job.ID, job.Type)
+	attempt := job.RetryCount + 1
+	err := handler.Handle(ctx, job)
+	if err == nil {
+		log.Printf("[Worker-%d] successfully processed job %s (type: %s)", workerID, job.ID, job.Type)
+		return
+	}
+
+	job.RecordError(err, attempt)
+
+	if attempt >= maxAttempts {
+		if err := w.enqueueDeadLetter(ctx, queue, job); err != nil {
+			log.Printf("[Worker-%d] failed to enqueue job %s to dead-letter queue: %v", workerID, job.ID, err)
+		}
+		log.Printf("[Worker-%d] job %s (type: %s) failed after %d attempts: %v",
+			workerID, job.ID, job.Type, attempt, err)
+		return
+	}
+
+	if w.config.RetryOnErr {
+		if err := w.enqueueDelayedRetry(ctx, queue, job); err != nil {
+			log.Printf("[Worker-%d] failed to enqueue retry for job %s: %v", workerID, job.ID, err)
 			return
 		}
-		lastErr = err
+		log.Printf("[Worker-%d] job %s failed (attempt %d/%d): %v, queued for retry",
+			workerID, job.ID, attempt, maxAttempts, err)
+	}
+}
 
-		if attempts < maxAttempts {
-			log.Printf("[Worker-%d] job %s failed (attempt %d/%d): %v, retrying...",
-				workerID, job.ID, attempts, maxAttempts, err)
-			select {
-			case <-time.After(w.config.RetryDelay):
-			case <-ctx.Done():
-				log.Printf("[Worker-%d] retry cancelled for job %s", workerID, job.ID)
-				return
+// promoteDelayed moves ready jobs from the delayed queue back to the main queue.
+func (w *Worker) promoteDelayed(ctx context.Context, jobType string) {
+	defer w.wg.Done()
+
+	queue, ok := w.registry.GetQueue(jobType)
+	if !ok {
+		log.Printf("[Promoter/%s] queue not found", jobType)
+		return
+	}
+
+	ticker := time.NewTicker(w.config.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.stopCh:
+			log.Printf("[Promoter/%s] stopping", jobType)
+			return
+		case <-ctx.Done():
+			log.Printf("[Promoter/%s] context cancelled", jobType)
+			return
+		case <-ticker.C:
+			if err := w.promoteReadyJobs(ctx, queue); err != nil {
+				log.Printf("[Promoter/%s] error promoting delayed jobs: %v", jobType, err)
 			}
 		}
 	}
+}
 
-	log.Printf("[Worker-%d] job %s (type: %s) failed after %d attempts: %v",
-		workerID, job.ID, job.Type, attempts, lastErr)
+// promoteReadyJobs moves ready jobs from delayed queue to main queue.
+func (w *Worker) promoteReadyJobs(ctx context.Context, queue *JobQueue) error {
+	key := w.delayedQueueName(queue.GetQueueName())
+	now := time.Now().UnixNano()
+
+	batchSize := w.config.DelayBatchSize
+	if batchSize < 1 {
+		batchSize = 50
+	}
+
+	members, err := queue.RangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", now), batchSize)
+	if err != nil {
+		return err
+	}
+
+	for _, member := range members {
+		if err := queue.RemoveFromSet(ctx, key, member); err != nil {
+			log.Printf("[Promoter/%s] failed to remove delayed job: %v", queue.GetJobType(), err)
+			continue
+		}
+		if err := queue.Enqueue(ctx, member); err != nil {
+			log.Printf("[Promoter/%s] failed to requeue delayed job: %v", queue.GetJobType(), err)
+			continue
+		}
+	}
+
+	return nil
+}
+
+// enqueueDelayedRetry adds a job to the delayed retry sorted set.
+func (w *Worker) enqueueDelayedRetry(ctx context.Context, queue *JobQueue, job *Job) error {
+	key := w.delayedQueueName(queue.GetQueueName())
+	executeAt := time.Now().Add(w.config.RetryDelay).UnixNano()
+
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job for retry: %w", err)
+	}
+
+	return queue.AddToSet(ctx, key, float64(executeAt), string(payload))
+}
+
+// enqueueDeadLetter stores a failed job in the dead-letter queue.
+func (w *Worker) enqueueDeadLetter(ctx context.Context, queue *JobQueue, job *Job) error {
+	key := w.deadLetterQueueName(queue.GetQueueName())
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal dead-letter job: %w", err)
+	}
+	return queue.GetClient().RPush(ctx, key, payload).Err()
+}
+
+func (w *Worker) delayedQueueName(queueName string) string {
+	return fmt.Sprintf("%s:delayed", queueName)
+}
+
+func (w *Worker) deadLetterQueueName(queueName string) string {
+	return fmt.Sprintf("%s:dead", queueName)
 }
 
 // Stop signals the worker to stop processing jobs.

@@ -24,17 +24,31 @@ var templateFS embed.FS
 
 // QueueStats represents statistics for a queue.
 type QueueStats struct {
-	Name      string `json:"name"`
-	JobType   string `json:"job_type"`
-	Size      int64  `json:"size"`
-	QueueName string `json:"queue_name"`
+	Name           string `json:"name"`
+	JobType        string `json:"job_type"`
+	Size           int64  `json:"size"`
+	QueueName      string `json:"queue_name"`
+	DelayedSize    int64  `json:"delayed_size"`
+	DeadLetterSize int64  `json:"dead_letter_size"`
 }
 
 // JobInfo represents job information for display.
 type JobInfo struct {
-	ID      string                 `json:"id"`
-	Type    string                 `json:"type"`
-	Payload map[string]interface{} `json:"payload"`
+	ID         string                   `json:"id"`
+	Type       string                   `json:"type"`
+	Payload    map[string]interface{}   `json:"payload"`
+	RetryCount int                      `json:"retry_count,omitempty"`
+	Errors     []redisqueue.JobError    `json:"errors,omitempty"`
+}
+
+// DeadLetterJobInfo represents a job in the dead-letter queue.
+type DeadLetterJobInfo struct {
+	ID         string                 `json:"id"`
+	Type       string                 `json:"type"`
+	Payload    map[string]interface{} `json:"payload"`
+	RetryCount int                    `json:"retry_count"`
+	Errors     []redisqueue.JobError  `json:"errors"`
+	QueueName  string                 `json:"queue_name"`
 }
 
 // QueueUpdate represents an update sent via SSE.
@@ -107,6 +121,10 @@ func main() {
 	http.HandleFunc("/", dashboard.handleIndex)
 	http.HandleFunc("/api/queues", dashboard.handleQueuesAPI)
 	http.HandleFunc("/api/queue/", dashboard.handleQueueJobsAPI)
+	http.HandleFunc("/api/jobs", dashboard.handleCreateJobAPI)
+	http.HandleFunc("/api/dead-letter/", dashboard.handleDeadLetterAPI)
+	http.HandleFunc("/api/replay-job/", dashboard.handleReplayJobAPI)
+	http.HandleFunc("/api/delayed/", dashboard.handleDelayedAPI)
 	http.HandleFunc("/events", dashboard.handleSSE)
 
 	addr := ":" + port
@@ -188,6 +206,97 @@ func (d *Dashboard) handleQueueJobsAPI(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(jobInfos)
+}
+
+// CreateJobRequest represents the request body for creating a job.
+type CreateJobRequest struct {
+	Queue   string                 `json:"queue"`            // Queue name (job type)
+	ID      string                 `json:"id,omitempty"`     // Optional job ID (generated if not provided)
+	Payload map[string]interface{} `json:"payload"`          // Job payload
+}
+
+// CreateJobResponse represents the response for a created job.
+type CreateJobResponse struct {
+	ID      string                 `json:"id"`
+	Type    string                 `json:"type"`
+	Queue   string                 `json:"queue"`
+	Payload map[string]interface{} `json:"payload"`
+}
+
+// handleCreateJobAPI handles POST requests to create a new job.
+func (d *Dashboard) handleCreateJobAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CreateJobRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields
+	if req.Queue == "" {
+		http.Error(w, "queue is required", http.StatusBadRequest)
+		return
+	}
+	if req.Payload == nil {
+		http.Error(w, "payload is required", http.StatusBadRequest)
+		return
+	}
+
+	// Check if queue/job type is registered
+	queue, ok := d.registry.GetQueue(req.Queue)
+	if !ok {
+		http.Error(w, "queue not found: "+req.Queue, http.StatusNotFound)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Create job with provided or generated ID
+	job := &redisqueue.Job{
+		Type: req.Queue,
+	}
+	
+	// Use provided ID or generate a new one
+	if req.ID != "" {
+		job.ID = req.ID
+	} else {
+		job.ID = generateJobID()
+	}
+
+	// Marshal payload
+	payloadBytes, err := json.Marshal(req.Payload)
+	if err != nil {
+		http.Error(w, "Failed to marshal payload: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	job.Payload = payloadBytes
+
+	// Enqueue the job
+	if err := queue.EnqueueJob(ctx, job); err != nil {
+		http.Error(w, "Failed to enqueue job: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return the created job
+	response := CreateJobResponse{
+		ID:      job.ID,
+		Type:    job.Type,
+		Queue:   queue.GetQueueName(),
+		Payload: req.Payload,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(response)
+}
+
+// generateJobID generates a unique job ID.
+func generateJobID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
 // handleSSE handles Server-Sent Events connections.
@@ -290,15 +399,256 @@ func (d *Dashboard) getQueueStats(ctx context.Context) []QueueStats {
 			size = -1
 		}
 
+		// Get delayed queue size
+		delayedKey := fmt.Sprintf("%s:delayed", queue.GetQueueName())
+		delayedSize, _ := d.client.ZCard(ctx, delayedKey).Result()
+
+		// Get dead-letter queue size
+		deadKey := fmt.Sprintf("%s:dead", queue.GetQueueName())
+		deadSize, _ := d.client.LLen(ctx, deadKey).Result()
+
 		stats = append(stats, QueueStats{
-			Name:      jt,
-			JobType:   jt,
-			Size:      size,
-			QueueName: queue.GetQueueName(),
+			Name:           jt,
+			JobType:        jt,
+			Size:           size,
+			QueueName:      queue.GetQueueName(),
+			DelayedSize:    delayedSize,
+			DeadLetterSize: deadSize,
 		})
 	}
 
 	return stats
+}
+
+// handleDeadLetterAPI handles requests for dead-letter queue operations.
+// GET /api/dead-letter/{jobType} - list dead-letter jobs
+// DELETE /api/dead-letter/{jobType} - clear dead-letter queue
+func (d *Dashboard) handleDeadLetterAPI(w http.ResponseWriter, r *http.Request) {
+	// Extract job type from URL path
+	path := r.URL.Path[len("/api/dead-letter/"):]
+	if path == "" {
+		http.Error(w, "job type required", http.StatusBadRequest)
+		return
+	}
+
+	// Split path to get job type and optional job ID
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		http.Error(w, "job type required", http.StatusBadRequest)
+		return
+	}
+
+	jobType := parts[0]
+	queue, ok := d.registry.GetQueue(jobType)
+	if !ok {
+		http.Error(w, "queue not found", http.StatusNotFound)
+		return
+	}
+
+	deadKey := fmt.Sprintf("%s:dead", queue.GetQueueName())
+	ctx := r.Context()
+
+	switch r.Method {
+	case http.MethodGet:
+		// List dead-letter jobs
+		jobs, err := d.client.LRange(ctx, deadKey, 0, 100).Result()
+		if err != nil && err != redis.Nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		deadJobs := make([]DeadLetterJobInfo, 0, len(jobs))
+		for _, jobStr := range jobs {
+			var job redisqueue.Job
+			if err := json.Unmarshal([]byte(jobStr), &job); err != nil {
+				continue
+			}
+			var payload map[string]interface{}
+			json.Unmarshal(job.Payload, &payload)
+			deadJobs = append(deadJobs, DeadLetterJobInfo{
+				ID:         job.ID,
+				Type:       job.Type,
+				Payload:    payload,
+				RetryCount: job.RetryCount,
+				Errors:     job.Errors,
+				QueueName:  queue.GetQueueName(),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(deadJobs)
+
+	case http.MethodDelete:
+		// Clear dead-letter queue
+		if err := d.client.Del(ctx, deadKey).Err(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleReplayJobAPI handles replaying a dead-letter job.
+// POST /api/replay-job/{jobType}/{jobID}
+func (d *Dashboard) handleReplayJobAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job type and job ID from URL path
+	path := r.URL.Path[len("/api/replay-job/"):]
+	parts := splitPath(path)
+	if len(parts) < 2 {
+		http.Error(w, "job type and job ID required", http.StatusBadRequest)
+		return
+	}
+
+	jobType := parts[0]
+	jobID := parts[1]
+
+	queue, ok := d.registry.GetQueue(jobType)
+	if !ok {
+		http.Error(w, "queue not found", http.StatusNotFound)
+		return
+	}
+
+	ctx := r.Context()
+	deadKey := fmt.Sprintf("%s:dead", queue.GetQueueName())
+
+	// Find and remove the job from dead-letter queue
+	jobs, err := d.client.LRange(ctx, deadKey, 0, -1).Result()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var foundJob *redisqueue.Job
+	for _, jobStr := range jobs {
+		var job redisqueue.Job
+		if err := json.Unmarshal([]byte(jobStr), &job); err != nil {
+			continue
+		}
+		if job.ID == jobID {
+			foundJob = &job
+			// Remove this specific job from dead-letter queue
+			d.client.LRem(ctx, deadKey, 1, jobStr)
+			break
+		}
+	}
+
+	if foundJob == nil {
+		http.Error(w, "job not found in dead-letter queue", http.StatusNotFound)
+		return
+	}
+
+	// Reset retry count and errors for replay
+	newJob := &redisqueue.Job{
+		ID:      foundJob.ID,
+		Type:    foundJob.Type,
+		Payload: foundJob.Payload,
+	}
+
+	// Enqueue to main queue
+	if err := queue.EnqueueJob(ctx, newJob); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "replayed",
+		"job_id":  newJob.ID,
+		"queue":   jobType,
+	})
+}
+
+// handleDelayedAPI handles requests for delayed queue.
+// GET /api/delayed/{jobType} - list delayed jobs
+func (d *Dashboard) handleDelayedAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job type from URL path
+	jobType := r.URL.Path[len("/api/delayed/"):]
+	if jobType == "" {
+		http.Error(w, "job type required", http.StatusBadRequest)
+		return
+	}
+
+	queue, ok := d.registry.GetQueue(jobType)
+	if !ok {
+		http.Error(w, "queue not found", http.StatusNotFound)
+		return
+	}
+
+	ctx := r.Context()
+	delayedKey := fmt.Sprintf("%s:delayed", queue.GetQueueName())
+
+	// Get delayed jobs (with scores as timestamps)
+	results, err := d.client.ZRangeWithScores(ctx, delayedKey, 0, 100).Result()
+	if err != nil && err != redis.Nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	type DelayedJobInfo struct {
+		ID          string                 `json:"id"`
+		Type        string                 `json:"type"`
+		Payload     map[string]interface{} `json:"payload"`
+		RetryCount  int                    `json:"retry_count"`
+		ExecuteAt   string                 `json:"execute_at"`
+	}
+
+	delayedJobs := make([]DelayedJobInfo, 0, len(results))
+	for _, z := range results {
+		var job redisqueue.Job
+		if err := json.Unmarshal([]byte(z.Member.(string)), &job); err != nil {
+			continue
+		}
+		var payload map[string]interface{}
+		json.Unmarshal(job.Payload, &payload)
+		executeAt := time.Unix(0, int64(z.Score)).UTC().Format(time.RFC3339)
+		delayedJobs = append(delayedJobs, DelayedJobInfo{
+			ID:         job.ID,
+			Type:       job.Type,
+			Payload:    payload,
+			RetryCount: job.RetryCount,
+			ExecuteAt:  executeAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(delayedJobs)
+}
+
+// splitPath splits a URL path into parts, removing empty strings.
+func splitPath(path string) []string {
+	parts := make([]string, 0)
+	for _, p := range []byte(path) {
+		if len(parts) == 0 {
+			parts = append(parts, "")
+		}
+		if p == '/' {
+			parts = append(parts, "")
+		} else {
+			parts[len(parts)-1] += string(p)
+		}
+	}
+	// Filter empty strings
+	result := make([]string, 0)
+	for _, p := range parts {
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }
 
 func getEnv(key, defaultValue string) string {

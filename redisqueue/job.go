@@ -4,15 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
 
+// JobError captures details of a failed attempt.
+type JobError struct {
+	Attempt   int    `json:"attempt"`
+	Message   string `json:"message"`
+	FailedAt  string `json:"failed_at"`
+}
+
 // Job represents a unit of work to be processed.
 type Job struct {
-	ID      string          `json:"id"`
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
+	ID         string          `json:"id"`
+	Type       string          `json:"type"`
+	Payload    json.RawMessage `json:"payload"`
+	RetryCount int             `json:"retry_count,omitempty"`
+	Errors     []JobError      `json:"errors,omitempty"`
 }
 
 // NewJob creates a new Job with a unique ID.
@@ -26,6 +36,16 @@ func NewJob(jobType string, payload any) (*Job, error) {
 		Type:    jobType,
 		Payload: payloadBytes,
 	}, nil
+}
+
+// RecordError appends a failure entry to the job and increments the retry count.
+func (j *Job) RecordError(err error, attempt int) {
+	j.RetryCount = attempt
+	j.Errors = append(j.Errors, JobError{
+		Attempt:  attempt,
+		Message: err.Error(),
+		FailedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
 }
 
 // ParsePayload unmarshals the job payload into the provided destination.

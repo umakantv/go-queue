@@ -74,3 +74,23 @@ func (q *RedisQueue) GetQueueName() string {
 func (q *RedisQueue) GetClient() *redis.Client {
 	return q.client
 }
+
+// RemoveFromSet removes a member from a sorted set key.
+func (q *RedisQueue) RemoveFromSet(ctx context.Context, key string, member string) error {
+	return q.client.ZRem(ctx, key, member).Err()
+}
+
+// AddToSet adds a member to a sorted set key with a score.
+func (q *RedisQueue) AddToSet(ctx context.Context, key string, score float64, member string) error {
+	return q.client.ZAdd(ctx, key, redis.Z{Score: score, Member: member}).Err()
+}
+
+// RangeByScore returns members from a sorted set within a score range.
+func (q *RedisQueue) RangeByScore(ctx context.Context, key string, min, max string, count int64) ([]string, error) {
+	query := &redis.ZRangeBy{Min: min, Max: max}
+	if count > 0 {
+		query.Offset = 0
+		query.Count = count
+	}
+	return q.client.ZRangeByScore(ctx, key, query).Result()
+}

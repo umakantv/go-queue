@@ -27,7 +27,7 @@ func main() {
 	pollInterval := flag.Duration("poll-interval", 100*time.Millisecond, "Interval between polling attempts")
 	retry := flag.Bool("retry", false, "Enable retry for failed jobs")
 	retryDelay := flag.Duration("retry-delay", 1*time.Second, "Delay before retrying a failed job")
-	maxRetries := flag.Int("max-retries", 3, "Maximum number of retries for failed jobs")
+	maxRetries := flag.Int("max-retries", 3, "Maximum number of total attempts (including initial attempt)")
 	flag.Parse()
 
 	// Create a Redis client

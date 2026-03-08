@@ -1,18 +1,16 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"time"
-
-	redisqueue "github.com/umakantv/redis-queue/redisqueue"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // EmailPayload represents the payload for an email job.
@@ -26,6 +24,29 @@ type EmailPayload struct {
 type DownloadPayload struct {
 	URL      string `json:"url"`
 	Filename string `json:"filename"`
+}
+
+// CreateJobRequest represents the request body for creating a job.
+type CreateJobRequest struct {
+	Queue   string      `json:"queue"`
+	ID      string      `json:"id,omitempty"`
+	Payload interface{} `json:"payload"`
+}
+
+// CreateJobResponse represents the response from creating a job.
+type CreateJobResponse struct {
+	ID      string                 `json:"id"`
+	Type    string                 `json:"type"`
+	Queue   string                 `json:"queue"`
+	Payload map[string]interface{} `json:"payload"`
+}
+
+// QueueStats represents statistics for a queue.
+type QueueStats struct {
+	Name      string `json:"name"`
+	JobType   string `json:"job_type"`
+	Size      int64  `json:"size"`
+	QueueName string `json:"queue_name"`
 }
 
 var (
@@ -75,37 +96,12 @@ func main() {
 	jobType := flag.String("type", "", "Job type: email or download (required)")
 	count := flag.Int("count", 1, "Number of jobs to create")
 	list := flag.Bool("list", false, "List pending jobs in queues")
+	serverURL := flag.String("server", getEnv("DASHBOARD_URL", "http://localhost:8080"), "Dashboard server URL")
 	flag.Parse()
-
-	// Create a Redis client
-	client := redis.NewClient(&redis.Options{
-		Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
-		Password: getEnv("REDIS_PASSWORD", ""),
-		DB:       0,
-	})
-
-	// Test connection
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	_, err := client.Ping(ctx).Result()
-	cancel()
-	if err != nil {
-		log.Fatalf("Failed to connect to Redis: %v", err)
-	}
-
-	// Create registry
-	registry := redisqueue.NewRegistry(client)
-
-	// Register both job types (without handlers, just for enqueueing)
-	registry.RegisterFunc("email", "queue:email", func(ctx context.Context, job *redisqueue.Job) error {
-		return nil
-	})
-	registry.RegisterFunc("download", "queue:download", func(ctx context.Context, job *redisqueue.Job) error {
-		return nil
-	})
 
 	// List mode
 	if *list {
-		listQueues(ctx, registry)
+		listQueues(*serverURL)
 		return
 	}
 
@@ -116,6 +112,7 @@ func main() {
 		fmt.Println("  producer -type email [-count N]    Create N email jobs")
 		fmt.Println("  producer -type download [-count N] Create N download jobs")
 		fmt.Println("  producer -list                     List pending jobs in queues")
+		fmt.Println("  producer -server URL               Dashboard server URL (default: http://localhost:8080)")
 		os.Exit(1)
 	}
 
@@ -123,31 +120,33 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	// Create jobs
-	ctx = context.Background()
+	var created int
 	switch *jobType {
 	case "email":
 		for i := 0; i < *count; i++ {
 			payload := generateEmailPayload()
-			job, err := registry.Enqueue(ctx, "email", payload)
+			job, err := createJob(*serverURL, "email", payload)
 			if err != nil {
-				log.Printf("Failed to enqueue email job: %v", err)
+				log.Printf("Failed to create email job: %v", err)
 				continue
 			}
 			fmt.Printf("Created email job %s: to=%s, subject=%s\n", job.ID, payload.To, payload.Subject)
+			created++
 		}
-		fmt.Printf("\nCreated %d email job(s)\n", *count)
+		fmt.Printf("\nCreated %d email job(s)\n", created)
 
 	case "download":
 		for i := 0; i < *count; i++ {
 			payload := generateDownloadPayload()
-			job, err := registry.Enqueue(ctx, "download", payload)
+			job, err := createJob(*serverURL, "download", payload)
 			if err != nil {
-				log.Printf("Failed to enqueue download job: %v", err)
+				log.Printf("Failed to create download job: %v", err)
 				continue
 			}
 			fmt.Printf("Created download job %s: url=%s, filename=%s\n", job.ID, payload.URL, payload.Filename)
+			created++
 		}
-		fmt.Printf("\nCreated %d download job(s)\n", *count)
+		fmt.Printf("\nCreated %d download job(s)\n", created)
 
 	default:
 		log.Fatalf("Unknown job type: %s (use 'email' or 'download')", *jobType)
@@ -192,26 +191,74 @@ func getExtension(url string) string {
 	return ""
 }
 
-func listQueues(ctx context.Context, registry *redisqueue.Registry) {
-	fmt.Println("Queue Status:")
-	fmt.Println("=============")
-
-	if queue, ok := registry.GetQueue("email"); ok {
-		size, err := queue.Size(ctx)
-		if err != nil {
-			fmt.Printf("  Email queue: error getting size: %v\n", err)
-		} else {
-			fmt.Printf("  Email queue: %d pending jobs\n", size)
-		}
+// createJob sends a request to the dashboard API to create a job.
+func createJob(serverURL, queue string, payload interface{}) (*CreateJobResponse, error) {
+	req := CreateJobRequest{
+		Queue:   queue,
+		Payload: payload,
 	}
 
-	if queue, ok := registry.GetQueue("download"); ok {
-		size, err := queue.Size(ctx)
-		if err != nil {
-			fmt.Printf("  Download queue: error getting size: %v\n", err)
-		} else {
-			fmt.Printf("  Download queue: %d pending jobs\n", size)
-		}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/api/jobs", serverURL)
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var job CreateJobResponse
+	if err := json.Unmarshal(respBody, &job); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &job, nil
+}
+
+// listQueues fetches and displays queue status from the dashboard API.
+func listQueues(serverURL string) {
+	url := fmt.Sprintf("%s/api/queues", serverURL)
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Fatalf("Failed to fetch queue status: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("Failed to read response: %v", err)
+	}
+
+	var queues []QueueStats
+	if err := json.Unmarshal(body, &queues); err != nil {
+		log.Fatalf("Failed to parse response: %v", err)
+	}
+
+	fmt.Println("Queue Status:")
+	fmt.Println("=============")
+	for _, q := range queues {
+		fmt.Printf("  %s queue: %d pending jobs\n", q.Name, q.Size)
 	}
 }
 
@@ -224,13 +271,4 @@ func getEnv(key, defaultValue string) string {
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-}
-
-// Helper to pretty print job details
-func printJobDetails(job *redisqueue.Job) {
-	var payload map[string]interface{}
-	if err := json.Unmarshal(job.Payload, &payload); err == nil {
-		data, _ := json.MarshalIndent(payload, "  ", "  ")
-		fmt.Printf("  Job ID: %s\n  Type: %s\n  Payload:\n  %s\n", job.ID, job.Type, string(data))
-	}
 }
