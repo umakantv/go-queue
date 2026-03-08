@@ -29,8 +29,8 @@ func main() {
 	pollInterval := flag.Duration("poll-interval", 100*time.Millisecond, "Interval between polling attempts")
 	retry := flag.Bool("retry", false, "Enable retry for failed jobs")
 	retryDelay := flag.Duration("retry-delay", 1*time.Second, "Delay before retrying a failed job")
-	maxRetries := flag.Int("max-retries", 3, "Maximum number of total attempts (including initial attempt)")
 	flag.Parse()
+
 
 	// Create a Redis client
 	client := redis.NewClient(&redis.Options{
@@ -81,12 +81,12 @@ func main() {
 		PollInterval: *pollInterval,
 		RetryOnErr:   *retry,
 		RetryDelay:   *retryDelay,
-		MaxRetries:   *maxRetries,
 	}
 	worker := redisqueue.NewWorkerWithConfig(registry, config)
 
-	log.Printf("Email worker started with config: concurrency=%d, poll-interval=%v, retry=%v, retry-delay=%v, max-retries=%d",
-		config.Concurrency, config.PollInterval, config.RetryOnErr, config.RetryDelay, config.MaxRetries)
+	log.Printf("Email worker started with config: concurrency=%d, poll-interval=%v, retry=%v, retry-delay=%v",
+		config.Concurrency, config.PollInterval, config.RetryOnErr, config.RetryDelay)
+
 	log.Println("Waiting for jobs...")
 
 	// Handle graceful shutdown

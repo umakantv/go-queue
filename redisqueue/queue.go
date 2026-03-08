@@ -2,6 +2,7 @@ package redisqueue
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -9,16 +10,23 @@ import (
 
 // RedisQueue represents a Redis-backed queue implementation.
 type RedisQueue struct {
-	client    *redis.Client
-	queueName string
+	client            *redis.Client
+	queueName         string
+	visibilityTimeout time.Duration
 }
 
 // NewRedisQueue creates a new RedisQueue instance with the given Redis client and queue name.
 func NewRedisQueue(client *redis.Client, queueName string) *RedisQueue {
 	return &RedisQueue{
-		client:    client,
-		queueName: queueName,
+		client:            client,
+		queueName:         queueName,
+		visibilityTimeout: 1 * time.Minute, // Default visibility timeout
 	}
+}
+
+// SetVisibilityTimeout sets the visibility timeout for the queue.
+func (q *RedisQueue) SetVisibilityTimeout(timeout time.Duration) {
+	q.visibilityTimeout = timeout
 }
 
 // Enqueue adds a value to the end of the queue.
@@ -27,14 +35,43 @@ func (q *RedisQueue) Enqueue(ctx context.Context, value string) error {
 }
 
 // Dequeue removes and returns a value from the front of the queue.
-// It blocks until a value is available or the context is cancelled.
+// It uses a processing set (Sorted Set) to handle visibility timeouts.
 func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
-	result, err := q.client.LPop(ctx, q.queueName).Result()
+	// Atomically pop from list and add to processing sorted set
+	// Using a Lua script to ensure atomicity
+	script := `
+		local val = redis.call('LPOP', KEYS[1])
+		if val then
+			redis.call('ZADD', KEYS[2], ARGV[1], val)
+		end
+		return val
+	`
+	processingKey := q.GetProcessingKey()
+	now := time.Now().Add(q.visibilityTimeout).UnixNano()
+
+	val, err := q.client.Eval(ctx, script, []string{q.queueName, processingKey}, now).Result()
 	if err != nil {
-		return "", err
+		if err == redis.Nil {
+			return "", err
+		}
+		return "", fmt.Errorf("failed to dequeue with visibility timeout: %w", err)
 	}
-	return result, nil
+	if val == nil {
+		return "", redis.Nil
+	}
+	return val.(string), nil
 }
+
+// Complete removes a job from the processing set.
+func (q *RedisQueue) Complete(ctx context.Context, value string) error {
+	return q.client.ZRem(ctx, q.GetProcessingKey(), value).Err()
+}
+
+// GetProcessingKey returns the key for the processing sorted set.
+func (q *RedisQueue) GetProcessingKey() string {
+	return fmt.Sprintf("%s:processing", q.queueName)
+}
+
 
 // DequeueWithTimeout removes and returns a value from the front of the queue.
 // It blocks until a value is available, the timeout is reached, or the context is cancelled.

@@ -26,12 +26,21 @@ type DownloadPayload struct {
 	Filename string `json:"filename"`
 }
 
+// ReportPayload represents the payload for a prepare-report job.
+type ReportPayload struct {
+	ReportType string `json:"report_type"`
+	StartDate  string `json:"start_date"`
+	EndDate    string `json:"end_date"`
+}
+
 // CreateJobRequest represents the request body for creating a job.
 type CreateJobRequest struct {
-	Queue   string      `json:"queue"`
-	ID      string      `json:"id,omitempty"`
-	Payload interface{} `json:"payload"`
+	Queue      string      `json:"queue"`
+	ID         string      `json:"id,omitempty"`
+	MaxRetries int         `json:"max_retries"`
+	Payload    interface{} `json:"payload"`
 }
+
 
 // CreateJobResponse represents the response from creating a job.
 type CreateJobResponse struct {
@@ -90,14 +99,25 @@ var (
 		"example.com",
 		"company.org",
 	}
+
+	reportTypes = []string{
+		"monthly_sales",
+		"quarterly_financial",
+		"user_analytics",
+		"inventory_summary",
+		"performance_metrics",
+	}
 )
 
 func main() {
 	jobType := flag.String("type", "", "Job type: email or download (required)")
 	count := flag.Int("count", 1, "Number of jobs to create")
+	maxRetries := flag.Int("max-retries", 0, "Maximum number of retries for the jobs (default 0)")
 	list := flag.Bool("list", false, "List pending jobs in queues")
 	serverURL := flag.String("server", getEnv("DASHBOARD_URL", "http://localhost:8080"), "Dashboard server URL")
 	flag.Parse()
+
+
 
 	// List mode
 	if *list {
@@ -109,10 +129,12 @@ func main() {
 	if *jobType == "" {
 		fmt.Println("Error: -type flag is required")
 		fmt.Println("Usage:")
-		fmt.Println("  producer -type email [-count N]    Create N email jobs")
-		fmt.Println("  producer -type download [-count N] Create N download jobs")
-		fmt.Println("  producer -list                     List pending jobs in queues")
-		fmt.Println("  producer -server URL               Dashboard server URL (default: http://localhost:8080)")
+		fmt.Println("  producer -type email [-count N] [-max-retries M]         Create N email jobs")
+		fmt.Println("  producer -type download [-count N] [-max-retries M]      Create N download jobs")
+		fmt.Println("  producer -type prepare-report [-count N] [-max-retries M] Create N prepare-report jobs")
+
+		fmt.Println("  producer -list                          List pending jobs in queues")
+		fmt.Println("  producer -server URL                    Dashboard server URL (default: http://localhost:8080)")
 		os.Exit(1)
 	}
 
@@ -125,7 +147,7 @@ func main() {
 	case "email":
 		for i := 0; i < *count; i++ {
 			payload := generateEmailPayload()
-			job, err := createJob(*serverURL, "email", payload)
+			job, err := createJob(*serverURL, "email", payload, *maxRetries)
 			if err != nil {
 				log.Printf("Failed to create email job: %v", err)
 				continue
@@ -138,7 +160,7 @@ func main() {
 	case "download":
 		for i := 0; i < *count; i++ {
 			payload := generateDownloadPayload()
-			job, err := createJob(*serverURL, "download", payload)
+			job, err := createJob(*serverURL, "download", payload, *maxRetries)
 			if err != nil {
 				log.Printf("Failed to create download job: %v", err)
 				continue
@@ -148,8 +170,22 @@ func main() {
 		}
 		fmt.Printf("\nCreated %d download job(s)\n", created)
 
+	case "prepare-report":
+		for i := 0; i < *count; i++ {
+			payload := generateReportPayload()
+			job, err := createJob(*serverURL, "prepare-report", payload, *maxRetries)
+			if err != nil {
+				log.Printf("Failed to create prepare-report job: %v", err)
+				continue
+			}
+			fmt.Printf("Created prepare-report job %s: report_type=%s, start_date=%s, end_date=%s\n", job.ID, payload.ReportType, payload.StartDate, payload.EndDate)
+			created++
+		}
+		fmt.Printf("\nCreated %d prepare-report job(s)\n", created)
+
+
 	default:
-		log.Fatalf("Unknown job type: %s (use 'email' or 'download')", *jobType)
+		log.Fatalf("Unknown job type: %s (use 'email', 'download', or 'prepare-report')", *jobType)
 	}
 }
 
@@ -191,12 +227,37 @@ func getExtension(url string) string {
 	return ""
 }
 
-// createJob sends a request to the dashboard API to create a job.
-func createJob(serverURL, queue string, payload interface{}) (*CreateJobResponse, error) {
-	req := CreateJobRequest{
-		Queue:   queue,
-		Payload: payload,
+func generateReportPayload() ReportPayload {
+	reportType := reportTypes[rand.Intn(len(reportTypes))]
+	
+	// Add "[60s]" to roughly 10% of jobs to test visibility timeout
+	if rand.Intn(10) == 0 {
+		reportType = fmt.Sprintf("%s [60s]", reportType)
 	}
+
+	// Generate random dates within the last year
+	now := time.Now()
+	endOffset := rand.Intn(30) // 0-30 days ago
+	startOffset := endOffset + rand.Intn(90) + 1 // 1-91 days before end
+	
+	endDate := now.AddDate(0, 0, -endOffset)
+	startDate := now.AddDate(0, 0, -startOffset)
+	
+	return ReportPayload{
+		ReportType: reportType,
+		StartDate:  startDate.Format("2006-01-02"),
+		EndDate:    endDate.Format("2006-01-02"),
+	}
+}
+
+// createJob sends a request to the dashboard API to create a job.
+func createJob(serverURL, queue string, payload interface{}, maxRetries int) (*CreateJobResponse, error) {
+	req := CreateJobRequest{
+		Queue:      queue,
+		Payload:    payload,
+		MaxRetries: maxRetries,
+	}
+
 
 	body, err := json.Marshal(req)
 	if err != nil {

@@ -38,22 +38,34 @@ go get github.com/umakantv/redis-queue
    ```
    The dashboard will be available at `http://localhost:8080`
 
-3. **Start Workers** (in separate terminals):
+3. **Start the Broker** (separate terminal):
    ```bash
-   # Email worker with retry enabled
-   go run ./cmd/email -concurrency 2 -retry -max-retries 3
+   # Handles background job promotions for all types
+   go run ./cmd/broker
+   ```
+
+4. **Start Workers** (in separate terminals):
+   ```bash
+   # Email worker
+   go run ./cmd/email -concurrency 2
    
    # Download worker
    go run ./cmd/download
+   
+   # Prepare-report worker (long-running jobs)
+   go run ./cmd/prepare-report -concurrency 2
    ```
 
-4. **Produce Jobs**:
+5. **Produce Jobs**:
    ```bash
    # Create email jobs
    go run ./cmd/producer -type email -count 5
    
    # Create download jobs
    go run ./cmd/producer -type download -count 3
+   
+   # Create prepare-report jobs (long-running)
+   go run ./cmd/producer -type prepare-report -count 2
    
    # List pending jobs
    go run ./cmd/producer -list
@@ -69,7 +81,7 @@ Workers support the following command-line flags:
 | `-poll-interval` | 100ms | Interval between polling attempts |
 | `-retry` | false | Enable retry for failed jobs |
 | `-retry-delay` | 1s | Delay before retrying a failed job |
-| `-max-retries` | 3 | Maximum number of total attempts (including initial) |
+
 
 Example:
 ```bash
@@ -175,9 +187,11 @@ Create a new job and insert it into the specified queue.
 **Parameters:**
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `queue` | string | Yes | Queue name (job type): `email` or `download` |
+| `queue` | string | Yes | Queue name (job type): `email`, `download`, or `prepare-report` |
 | `id` | string | No | Custom job ID (auto-generated if omitted) |
+| `max_retries` | integer | No | Maximum number of retries (default: 0) |
 | `payload` | object | Yes | Job payload data |
+
 
 **Response (201 Created):**
 ```json
@@ -270,6 +284,43 @@ Payload structure:
   "url": "https://example.com/file.pdf",
   "filename": "document.pdf"
 }
+```
+
+### Prepare-Report Jobs
+
+Queue: `prepare-report` (Redis key: `queue:prepare-report`)
+
+Payload structure:
+```json
+{
+  "report_type": "monthly_sales",
+  "start_date": "2024-01-01",
+  "end_date": "2024-01-31"
+}
+```
+
+**Characteristics:**
+- **Processing Time**: 20-40 seconds per job (simulates long-running report generation)
+- **Use Case**: Demonstrates how the queue system handles jobs with indefinite or long processing times
+- **Progress Tracking**: Logs progress updates every 5 seconds during report generation
+- **Context Awareness**: Respects cancellation signals for graceful shutdown
+
+**Example Usage:**
+```bash
+# Create a prepare-report job via API
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "prepare-report",
+    "payload": {
+      "report_type": "quarterly_financial",
+      "start_date": "2024-01-01",
+      "end_date": "2024-03-31"
+    }
+  }'
+
+# Start the prepare-report worker
+go run ./cmd/prepare-report -concurrency 2
 ```
 
 ## Configuration

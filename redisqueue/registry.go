@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
 
 // Registry manages job type registrations and their associated queues.
 type Registry struct {
@@ -28,6 +30,11 @@ func NewRegistry(client *redis.Client) *Registry {
 // Register registers a new job type with its handler and queue name.
 // The queueName is the Redis list key that will store jobs of this type.
 func (r *Registry) Register(jobType string, queueName string, handler Handler) error {
+	return r.RegisterWithVisibility(jobType, queueName, handler, 1*time.Minute)
+}
+
+// RegisterWithVisibility registers a new job type with a specific visibility timeout.
+func (r *Registry) RegisterWithVisibility(jobType string, queueName string, handler Handler, visibilityTimeout time.Duration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -36,6 +43,7 @@ func (r *Registry) Register(jobType string, queueName string, handler Handler) e
 	}
 
 	redisQueue := NewRedisQueue(r.client, queueName)
+	redisQueue.SetVisibilityTimeout(visibilityTimeout)
 	jobQueue := NewJobQueue(redisQueue, jobType, handler)
 
 	r.queues[jobType] = jobQueue
@@ -44,13 +52,14 @@ func (r *Registry) Register(jobType string, queueName string, handler Handler) e
 	return nil
 }
 
+
 // RegisterFunc is a convenience method to register a handler function.
 func (r *Registry) RegisterFunc(jobType string, queueName string, handler HandlerFunc) error {
 	return r.Register(jobType, queueName, handler)
 }
 
-// Enqueue adds a new job to the queue for its registered job type.
-func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any) (*Job, error) {
+// Enqueue adds a new job to the queue for its registered job type with optional max retries.
+func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any, maxRetries int) (*Job, error) {
 	r.mu.RLock()
 	queue, exists := r.queues[jobType]
 	r.mu.RUnlock()
@@ -59,7 +68,7 @@ func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any) (*J
 		return nil, fmt.Errorf("job type %q is not registered", jobType)
 	}
 
-	job, err := NewJob(jobType, payload)
+	job, err := NewJob(jobType, payload, maxRetries)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create job: %w", err)
 	}
@@ -70,6 +79,7 @@ func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any) (*J
 
 	return job, nil
 }
+
 
 // GetQueue returns the JobQueue for the given job type.
 func (r *Registry) GetQueue(jobType string) (*JobQueue, bool) {

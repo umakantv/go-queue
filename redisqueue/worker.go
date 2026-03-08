@@ -17,7 +17,6 @@ type WorkerConfig struct {
 	PollInterval   time.Duration // Interval between polling attempts
 	RetryOnErr     bool          // Whether to retry failed jobs
 	RetryDelay     time.Duration // Delay before retrying a failed job
-	MaxRetries     int           // Maximum number of retries for failed jobs
 	DelayBatchSize int64         // Max jobs to promote from delayed queue per tick
 }
 
@@ -28,10 +27,10 @@ func DefaultWorkerConfig() WorkerConfig {
 		PollInterval:   100 * time.Millisecond,
 		RetryOnErr:     false,
 		RetryDelay:     1 * time.Second,
-		MaxRetries:     3,
 		DelayBatchSize: 50,
 	}
 }
+
 
 // Worker processes jobs from registered queues with configurable concurrency.
 type Worker struct {
@@ -61,9 +60,16 @@ func NewWorkerWithConfig(registry *Registry, config WorkerConfig) *Worker {
 	}
 }
 
+// StartPromoters begins only the promotion goroutines for a job type.
+func (w *Worker) StartPromoters(ctx context.Context, jobType string) {
+	w.wg.Add(1)
+	go w.promoteDelayed(ctx, jobType)
+	w.wg.Add(1)
+	go w.promoteProcessing(ctx, jobType)
+	log.Printf("Started promoters for job type %q", jobType)
+}
+
 // Start begins processing jobs for the specified job types.
-// If jobTypes is empty, all registered job types are processed.
-// Each job type gets 'Concurrency' number of goroutines polling its queue.
 func (w *Worker) Start(ctx context.Context, jobTypes ...string) {
 	types := jobTypes
 	if len(types) == 0 {
@@ -76,11 +82,112 @@ func (w *Worker) Start(ctx context.Context, jobTypes ...string) {
 			workerID := i + 1
 			go w.run(ctx, jt, workerID)
 		}
-		w.wg.Add(1)
-		go w.promoteDelayed(ctx, jt)
 		log.Printf("Started %d concurrent worker(s) for job type %q", w.config.Concurrency, jt)
 	}
 }
+
+
+// promoteProcessing moves expired jobs from the processing set back to the main queue.
+func (w *Worker) promoteProcessing(ctx context.Context, jobType string) {
+	defer w.wg.Done()
+
+	queue, ok := w.registry.GetQueue(jobType)
+	if !ok {
+		log.Printf("[ProcessingPromoter/%s] queue not found", jobType)
+		return
+	}
+
+	ticker := time.NewTicker(w.config.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.stopCh:
+			log.Printf("[ProcessingPromoter/%s] stopping", jobType)
+			return
+		case <-ctx.Done():
+			log.Printf("[ProcessingPromoter/%s] context cancelled", jobType)
+			return
+		case <-ticker.C:
+			if err := w.promoteExpiredProcessingJobs(ctx, queue); err != nil {
+				log.Printf("[ProcessingPromoter/%s] error promoting expired processing jobs: %v", jobType, err)
+			}
+		}
+	}
+}
+
+// promoteExpiredProcessingJobs moves expired jobs from processing set to main queue.
+// It increments the retry count and records a timeout error for visibility timeout expirations.
+func (w *Worker) promoteExpiredProcessingJobs(ctx context.Context, queue *JobQueue) error {
+	key := queue.GetProcessingKey()
+	now := time.Now().UnixNano()
+
+	batchSize := w.config.DelayBatchSize
+	if batchSize < 1 {
+		batchSize = 50
+	}
+
+	members, err := queue.RangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", now), batchSize)
+	if err != nil {
+		return err
+	}
+
+	for _, member := range members {
+		// Parse the job to update retry count and record timeout error
+		var job Job
+		if err := json.Unmarshal([]byte(member), &job); err != nil {
+			log.Printf("[ProcessingPromoter/%s] failed to unmarshal job: %v", queue.GetJobType(), err)
+			continue
+		}
+
+		// Increment retry count and record visibility timeout as an error
+		attempt := job.RetryCount + 1
+		job.RecordError(fmt.Errorf("visibility timeout expired - worker did not complete job in time"), attempt)
+
+		// Check if we've exceeded max retries (job-level)
+		maxAttempts := job.MaxRetries
+		if maxAttempts < 1 {
+			// No retries by default if not specified
+			maxAttempts = 0
+		}
+
+		if attempt > maxAttempts {
+			// Move to dead letter queue
+			if err := queue.RemoveFromSet(ctx, key, member); err != nil {
+				log.Printf("[ProcessingPromoter/%s] failed to remove expired processing job: %v", queue.GetJobType(), err)
+				continue
+			}
+			if err := w.enqueueDeadLetter(ctx, queue, &job); err != nil {
+				log.Printf("[ProcessingPromoter/%s] failed to move job %s to dead-letter queue: %v", queue.GetJobType(), job.ID, err)
+				continue
+			}
+			log.Printf("[ProcessingPromoter/%s] job %s exceeded max retries (%d), moved to dead-letter queue", queue.GetJobType(), job.ID, maxAttempts)
+			continue
+		}
+
+
+		// Re-serialize the job with updated retry count
+		updatedMember, err := json.Marshal(&job)
+		if err != nil {
+			log.Printf("[ProcessingPromoter/%s] failed to marshal updated job: %v", queue.GetJobType(), err)
+			continue
+		}
+
+		if err := queue.RemoveFromSet(ctx, key, member); err != nil {
+			log.Printf("[ProcessingPromoter/%s] failed to remove expired processing job: %v", queue.GetJobType(), err)
+			continue
+		}
+		if err := queue.Enqueue(ctx, string(updatedMember)); err != nil {
+			log.Printf("[ProcessingPromoter/%s] failed to requeue expired processing job: %v", queue.GetJobType(), err)
+			continue
+		}
+		// attempt is the new retry count after incrementing, so current attempt is attempt, next will be attempt+1
+		log.Printf("[ProcessingPromoter/%s] job %s visibility timeout expired, retry attempt %d/%d, moved back to main queue", queue.GetJobType(), job.ID, attempt, maxAttempts)
+	}
+
+	return nil
+}
+
 
 // run continuously processes jobs from a specific queue.
 func (w *Worker) run(ctx context.Context, jobType string, workerID int) {
@@ -116,6 +223,7 @@ func (w *Worker) run(ctx context.Context, jobType string, workerID int) {
 			}
 
 			// Process the job with optional retry
+			log.Printf("[Worker-%d/%s] picked up job %s (retry count: %d)", workerID, jobType, job.ID, job.RetryCount)
 			w.processWithRetry(ctx, job, handler, queue, workerID)
 		}
 	}
@@ -123,21 +231,29 @@ func (w *Worker) run(ctx context.Context, jobType string, workerID int) {
 
 // processWithRetry processes a job with optional retry logic.
 func (w *Worker) processWithRetry(ctx context.Context, job *Job, handler Handler, queue *JobQueue, workerID int) {
-	maxAttempts := w.config.MaxRetries
-	if maxAttempts < 1 {
-		maxAttempts = 1
+	maxAttempts := job.MaxRetries
+	if maxAttempts < 0 {
+		maxAttempts = 0
 	}
 
 	attempt := job.RetryCount + 1
 	err := handler.Handle(ctx, job)
 	if err == nil {
 		log.Printf("[Worker-%d] successfully processed job %s (type: %s)", workerID, job.ID, job.Type)
+		// Mark job as completed and remove from processing set
+		if err := queue.CompleteJob(ctx, job); err != nil {
+			log.Printf("[Worker-%d] failed to mark job %s as completed: %v", workerID, job.ID, err)
+		}
 		return
 	}
 
 	job.RecordError(err, attempt)
+	// Even on error, we should remove it from the processing set because it will be re-enqueued elsewhere
+	if err := queue.CompleteJob(ctx, job); err != nil {
+		log.Printf("[Worker-%d] failed to remove job %s from processing set after error: %v", workerID, job.ID, err)
+	}
 
-	if attempt >= maxAttempts {
+	if attempt > maxAttempts {
 		if err := w.enqueueDeadLetter(ctx, queue, job); err != nil {
 			log.Printf("[Worker-%d] failed to enqueue job %s to dead-letter queue: %v", workerID, job.ID, err)
 		}
@@ -155,6 +271,7 @@ func (w *Worker) processWithRetry(ctx context.Context, job *Job, handler Handler
 			workerID, job.ID, attempt, maxAttempts, err)
 	}
 }
+
 
 // promoteDelayed moves ready jobs from the delayed queue back to the main queue.
 func (w *Worker) promoteDelayed(ctx context.Context, jobType string) {

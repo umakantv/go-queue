@@ -22,21 +22,24 @@ type Job struct {
 	Type       string          `json:"type"`
 	Payload    json.RawMessage `json:"payload"`
 	RetryCount int             `json:"retry_count,omitempty"`
+	MaxRetries int             `json:"max_retries,omitempty"`
 	Errors     []JobError      `json:"errors,omitempty"`
 }
 
-// NewJob creates a new Job with a unique ID.
-func NewJob(jobType string, payload any) (*Job, error) {
+// NewJob creates a new Job with a unique ID and optional max retries.
+func NewJob(jobType string, payload any, maxRetries int) (*Job, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal job payload: %w", err)
 	}
 	return &Job{
-		ID:      uuid.New().String(),
-		Type:    jobType,
-		Payload: payloadBytes,
+		ID:         uuid.New().String(),
+		Type:       jobType,
+		Payload:    payloadBytes,
+		MaxRetries: maxRetries,
 	}, nil
 }
+
 
 // RecordError appends a failure entry to the job and increments the retry count.
 func (j *Job) RecordError(err error, attempt int) {
@@ -139,6 +142,16 @@ func (q *JobQueue) Process(ctx context.Context) error {
 	}
 	return q.handler.Handle(ctx, job)
 }
+
+// CompleteJob marks a job as successfully completed.
+func (q *JobQueue) CompleteJob(ctx context.Context, job *Job) error {
+	jobBytes, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job for completion: %w", err)
+	}
+	return q.Complete(ctx, string(jobBytes))
+}
+
 
 // GetJobType returns the job type this queue handles.
 func (q *JobQueue) GetJobType() string {

@@ -100,6 +100,10 @@ func main() {
 	registry.RegisterFunc("download", "queue:download", func(ctx context.Context, job *redisqueue.Job) error {
 		return nil
 	})
+	registry.RegisterWithVisibility("prepare-report", "queue:prepare-report", redisqueue.HandlerFunc(func(ctx context.Context, job *redisqueue.Job) error {
+		return nil
+	}), 60*time.Second)
+
 
 	// Parse templates
 	tmpl, err := template.ParseFS(templateFS, "templates/*.html")
@@ -210,10 +214,12 @@ func (d *Dashboard) handleQueueJobsAPI(w http.ResponseWriter, r *http.Request) {
 
 // CreateJobRequest represents the request body for creating a job.
 type CreateJobRequest struct {
-	Queue   string                 `json:"queue"`            // Queue name (job type)
-	ID      string                 `json:"id,omitempty"`     // Optional job ID (generated if not provided)
-	Payload map[string]interface{} `json:"payload"`          // Job payload
+	Queue      string                 `json:"queue"`            // Queue name (job type)
+	ID         string                 `json:"id,omitempty"`     // Optional job ID (generated if not provided)
+	MaxRetries int                    `json:"max_retries"`      // Optional max retries
+	Payload    map[string]interface{} `json:"payload"`          // Job payload
 }
+
 
 // CreateJobResponse represents the response for a created job.
 type CreateJobResponse struct {
@@ -257,8 +263,10 @@ func (d *Dashboard) handleCreateJobAPI(w http.ResponseWriter, r *http.Request) {
 
 	// Create job with provided or generated ID
 	job := &redisqueue.Job{
-		Type: req.Queue,
+		Type:       req.Queue,
+		MaxRetries: req.MaxRetries,
 	}
+
 	
 	// Use provided ID or generate a new one
 	if req.ID != "" {
