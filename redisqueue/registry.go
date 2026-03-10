@@ -58,8 +58,9 @@ func (r *Registry) RegisterFunc(jobType string, queueName string, handler Handle
 	return r.Register(jobType, queueName, handler)
 }
 
-// Enqueue adds a new job to the queue for its registered job type with optional max retries.
-func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any, maxRetries int) (*Job, error) {
+// Enqueue adds a new job to the queue for its registered job type with optional max retries and priority.
+// Priority defaults to DefaultPriority (3) if set to 0 or negative. Lower numbers = higher priority.
+func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any, maxRetries int, priority int) (*Job, error) {
 	r.mu.RLock()
 	queue, exists := r.queues[jobType]
 	r.mu.RUnlock()
@@ -68,7 +69,7 @@ func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any, max
 		return nil, fmt.Errorf("job type %q is not registered", jobType)
 	}
 
-	job, err := NewJob(jobType, payload, maxRetries)
+	job, err := NewJob(jobType, payload, maxRetries, priority)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create job: %w", err)
 	}

@@ -29,6 +29,7 @@ type QueueStats struct {
 	Size           int64  `json:"size"`
 	QueueName      string `json:"queue_name"`
 	DelayedSize    int64  `json:"delayed_size"`
+	ProcessingSize int64  `json:"processing_size"`
 	DeadLetterSize int64  `json:"dead_letter_size"`
 }
 
@@ -38,6 +39,7 @@ type JobInfo struct {
 	Type       string                   `json:"type"`
 	Payload    map[string]interface{}   `json:"payload"`
 	RetryCount int                      `json:"retry_count,omitempty"`
+	Priority   int                      `json:"priority"`
 	Errors     []redisqueue.JobError    `json:"errors,omitempty"`
 }
 
@@ -47,6 +49,7 @@ type DeadLetterJobInfo struct {
 	Type       string                 `json:"type"`
 	Payload    map[string]interface{} `json:"payload"`
 	RetryCount int                    `json:"retry_count"`
+	Priority   int                    `json:"priority"`
 	Errors     []redisqueue.JobError  `json:"errors"`
 	QueueName  string                 `json:"queue_name"`
 }
@@ -129,6 +132,7 @@ func main() {
 	http.HandleFunc("/api/dead-letter/", dashboard.handleDeadLetterAPI)
 	http.HandleFunc("/api/replay-job/", dashboard.handleReplayJobAPI)
 	http.HandleFunc("/api/delayed/", dashboard.handleDelayedAPI)
+	http.HandleFunc("/api/processing/", dashboard.handleProcessingAPI)
 	http.HandleFunc("/events", dashboard.handleSSE)
 
 	addr := ":" + port
@@ -202,9 +206,11 @@ func (d *Dashboard) handleQueueJobsAPI(w http.ResponseWriter, r *http.Request) {
 			payload = map[string]interface{}{"raw": string(job.Payload)}
 		}
 		jobInfos = append(jobInfos, JobInfo{
-			ID:      job.ID,
-			Type:    job.Type,
-			Payload: payload,
+			ID:         job.ID,
+			Type:       job.Type,
+			Payload:    payload,
+			RetryCount: job.RetryCount,
+			Priority:   job.Priority,
 		})
 	}
 
@@ -217,16 +223,18 @@ type CreateJobRequest struct {
 	Queue      string                 `json:"queue"`            // Queue name (job type)
 	ID         string                 `json:"id,omitempty"`     // Optional job ID (generated if not provided)
 	MaxRetries int                    `json:"max_retries"`      // Optional max retries
+	Priority   int                    `json:"priority"`         // Optional priority (default: 3, lower = higher priority)
 	Payload    map[string]interface{} `json:"payload"`          // Job payload
 }
 
 
 // CreateJobResponse represents the response for a created job.
 type CreateJobResponse struct {
-	ID      string                 `json:"id"`
-	Type    string                 `json:"type"`
-	Queue   string                 `json:"queue"`
-	Payload map[string]interface{} `json:"payload"`
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
+	Queue    string                 `json:"queue"`
+	Priority int                    `json:"priority"`
+	Payload  map[string]interface{} `json:"payload"`
 }
 
 // handleCreateJobAPI handles POST requests to create a new job.
@@ -265,9 +273,14 @@ func (d *Dashboard) handleCreateJobAPI(w http.ResponseWriter, r *http.Request) {
 	job := &redisqueue.Job{
 		Type:       req.Queue,
 		MaxRetries: req.MaxRetries,
+		Priority:   req.Priority,
 	}
 
-	
+	// Use default priority if not specified or invalid
+	if job.Priority <= 0 {
+		job.Priority = redisqueue.DefaultPriority
+	}
+
 	// Use provided ID or generate a new one
 	if req.ID != "" {
 		job.ID = req.ID
@@ -291,10 +304,11 @@ func (d *Dashboard) handleCreateJobAPI(w http.ResponseWriter, r *http.Request) {
 
 	// Return the created job
 	response := CreateJobResponse{
-		ID:      job.ID,
-		Type:    job.Type,
-		Queue:   queue.GetQueueName(),
-		Payload: req.Payload,
+		ID:       job.ID,
+		Type:     job.Type,
+		Queue:    queue.GetQueueName(),
+		Priority: job.Priority,
+		Payload:  req.Payload,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -411,6 +425,10 @@ func (d *Dashboard) getQueueStats(ctx context.Context) []QueueStats {
 		delayedKey := fmt.Sprintf("%s:delayed", queue.GetQueueName())
 		delayedSize, _ := d.client.ZCard(ctx, delayedKey).Result()
 
+		// Get processing queue size
+		processingKey := queue.GetProcessingKey()
+		processingSize, _ := d.client.ZCard(ctx, processingKey).Result()
+
 		// Get dead-letter queue size
 		deadKey := fmt.Sprintf("%s:dead", queue.GetQueueName())
 		deadSize, _ := d.client.LLen(ctx, deadKey).Result()
@@ -421,6 +439,7 @@ func (d *Dashboard) getQueueStats(ctx context.Context) []QueueStats {
 			Size:           size,
 			QueueName:      queue.GetQueueName(),
 			DelayedSize:    delayedSize,
+			ProcessingSize: processingSize,
 			DeadLetterSize: deadSize,
 		})
 	}
@@ -478,6 +497,7 @@ func (d *Dashboard) handleDeadLetterAPI(w http.ResponseWriter, r *http.Request) 
 				Type:       job.Type,
 				Payload:    payload,
 				RetryCount: job.RetryCount,
+				Priority:   job.Priority,
 				Errors:     job.Errors,
 				QueueName:  queue.GetQueueName(),
 			})
@@ -611,6 +631,7 @@ func (d *Dashboard) handleDelayedAPI(w http.ResponseWriter, r *http.Request) {
 		Type        string                 `json:"type"`
 		Payload     map[string]interface{} `json:"payload"`
 		RetryCount  int                    `json:"retry_count"`
+		Priority    int                    `json:"priority"`
 		ExecuteAt   string                 `json:"execute_at"`
 	}
 
@@ -628,12 +649,78 @@ func (d *Dashboard) handleDelayedAPI(w http.ResponseWriter, r *http.Request) {
 			Type:       job.Type,
 			Payload:    payload,
 			RetryCount: job.RetryCount,
+			Priority:   job.Priority,
 			ExecuteAt:  executeAt,
 		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(delayedJobs)
+}
+
+// handleProcessingAPI handles requests for processing queue.
+// GET /api/processing/{jobType} - list processing jobs
+func (d *Dashboard) handleProcessingAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job type from URL path
+	jobType := r.URL.Path[len("/api/processing/"):]
+	if jobType == "" {
+		http.Error(w, "job type required", http.StatusBadRequest)
+		return
+	}
+
+	queue, ok := d.registry.GetQueue(jobType)
+	if !ok {
+		http.Error(w, "queue not found", http.StatusNotFound)
+		return
+	}
+
+	ctx := r.Context()
+	processingKey := queue.GetProcessingKey()
+
+	// Get processing jobs (with scores as timestamps)
+	results, err := d.client.ZRangeWithScores(ctx, processingKey, 0, 100).Result()
+	if err != nil && err != redis.Nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	type ProcessingJobInfo struct {
+		ID         string                 `json:"id"`
+		Type       string                 `json:"type"`
+		Payload    map[string]interface{} `json:"payload"`
+		RetryCount int                    `json:"retry_count"`
+		Priority   int                    `json:"priority"`
+		VisibleAt  string                 `json:"visible_at"`
+		PickedUpAt string                 `json:"picked_up_at"`
+	}
+
+	processingJobs := make([]ProcessingJobInfo, 0, len(results))
+	for _, z := range results {
+		var job redisqueue.Job
+		if err := json.Unmarshal([]byte(z.Member.(string)), &job); err != nil {
+			continue
+		}
+		var payload map[string]interface{}
+		json.Unmarshal(job.Payload, &payload)
+		visibleAt := time.Unix(0, int64(z.Score)).UTC().Format(time.RFC3339)
+		processingJobs = append(processingJobs, ProcessingJobInfo{
+			ID:         job.ID,
+			Type:       job.Type,
+			Payload:    payload,
+			RetryCount: job.RetryCount,
+			Priority:   job.Priority,
+			VisibleAt:  visibleAt,
+			PickedUpAt: job.PickedUpAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(processingJobs)
 }
 
 // splitPath splits a URL path into parts, removing empty strings.

@@ -111,6 +111,9 @@
         .stat-item .count.delayed {
             color: #f5a623;
         }
+        .stat-item .count.processing {
+            color: #4facfe;
+        }
         .stat-item .count.dead {
             color: #f5576c;
         }
@@ -339,6 +342,10 @@
                         <div class="label">Delayed</div>
                     </div>
                     <div class="stat-item">
+                        <div class="count processing" id="processing-{{.Name}}">{{.ProcessingSize}}</div>
+                        <div class="label">Processing</div>
+                    </div>
+                    <div class="stat-item">
                         <div class="count dead" id="dead-{{.Name}}">{{.DeadLetterSize}}</div>
                         <div class="label">Dead</div>
                     </div>
@@ -360,6 +367,7 @@
             <div class="tabs" id="jobsTabs">
                 <button class="tab-btn active" data-tab="pending" onclick="switchTab('pending')">📥 Pending</button>
                 <button class="tab-btn" data-tab="delayed" onclick="switchTab('delayed')">⏱️ Delayed</button>
+                <button class="tab-btn" data-tab="processing" onclick="switchTab('processing')">⚙️ Processing</button>
                 <button class="tab-btn" data-tab="dead" onclick="switchTab('dead')">💀 Dead Letter</button>
             </div>
             
@@ -410,6 +418,7 @@
             queues.forEach(queue => {
                 const sizeEl = document.getElementById(`size-${queue.name}`);
                 const delayedEl = document.getElementById(`delayed-${queue.name}`);
+                const processingEl = document.getElementById(`processing-${queue.name}`);
                 const deadEl = document.getElementById(`dead-${queue.name}`);
                 
                 if (sizeEl) {
@@ -423,6 +432,9 @@
                 if (delayedEl) {
                     delayedEl.textContent = queue.delayed_size;
                 }
+                if (processingEl) {
+                    processingEl.textContent = queue.processing_size;
+                }
                 if (deadEl) {
                     deadEl.textContent = queue.dead_letter_size;
                 }
@@ -430,6 +442,7 @@
                 previousStats[queue.name] = {
                     size: queue.size,
                     delayed: queue.delayed_size,
+                    processing: queue.processing_size,
                     dead: queue.dead_letter_size
                 };
             });
@@ -464,6 +477,9 @@
                     case 'delayed':
                         url = `/api/delayed/${queueName}`;
                         break;
+                    case 'processing':
+                        url = `/api/processing/${queueName}`;
+                        break;
                     case 'dead':
                         url = `/api/dead-letter/${queueName}`;
                         break;
@@ -477,8 +493,8 @@
                 if (jobs.length === 0) {
                     jobsList.innerHTML = `
                         <div class="empty-state">
-                            <div class="empty-state-icon">${tab === 'dead' ? '🪦' : '📭'}</div>
-                            <div>${tab === 'pending' ? 'No pending jobs' : tab === 'delayed' ? 'No delayed jobs' : 'No dead jobs'}</div>
+                            <div class="empty-state-icon">${tab === 'dead' ? '🪦' : tab === 'processing' ? '⚙️' : '📭'}</div>
+                            <div>${tab === 'pending' ? 'No pending jobs' : tab === 'delayed' ? 'No delayed jobs' : tab === 'processing' ? 'No jobs currently processing' : 'No dead jobs'}</div>
                         </div>
                     `;
                     return;
@@ -488,6 +504,8 @@
                     jobsList.innerHTML = jobs.map(job => renderPendingJob(job)).join('');
                 } else if (tab === 'delayed') {
                     jobsList.innerHTML = jobs.map(job => renderDelayedJob(job)).join('');
+                } else if (tab === 'processing') {
+                    jobsList.innerHTML = jobs.map(job => renderProcessingJob(job)).join('');
                 } else if (tab === 'dead') {
                     jobsList.innerHTML = renderDeadLetterHeader() + jobs.map(job => renderDeadJob(job)).join('');
                 }
@@ -499,10 +517,14 @@
         function renderPendingJob(job) {
             const hasError = job.payload && job.payload.to && job.payload.to.toLowerCase().includes('error');
             const errorBadge = hasError ? '<span class="error-badge">Will Fail</span>' : '';
+            const priority = job.priority || 3;
             return `
                 <div class="job-item ${hasError ? 'has-error' : ''}">
                     <div class="job-header">
                         <div class="job-id">ID: ${job.id}${errorBadge}</div>
+                        <div class="job-actions">
+                            <span class="delayed-badge" style="background: #667eea;">Priority ${priority}</span>
+                        </div>
                     </div>
                     <div class="job-payload">${JSON.stringify(job.payload, null, 2)}</div>
                 </div>
@@ -511,13 +533,39 @@
 
         function renderDelayedJob(job) {
             const executeAt = job.execute_at || 'pending';
+            const priority = job.priority || 3;
             return `
                 <div class="job-item delayed">
                     <div class="job-header">
                         <div class="job-id">ID: ${job.id}<span class="delayed-badge">Retry #${job.retry_count}</span></div>
+                        <div class="job-actions">
+                            <span class="delayed-badge" style="background: #667eea;">Priority ${priority}</span>
+                        </div>
                     </div>
                     <div class="job-payload">${JSON.stringify(job.payload, null, 2)}</div>
                     <div class="job-meta">⏱️ Executes at: ${executeAt}</div>
+                </div>
+            `;
+        }
+
+        function renderProcessingJob(job) {
+            const visibleAt = job.visible_at || 'unknown';
+            const pickedUpAt = job.picked_up_at || 'unknown';
+            const priority = job.priority || 3;
+            return `
+                <div class="job-item" style="border-left-color: #4facfe; background: #f0f9ff;">
+                    <div class="job-header">
+                        <div class="job-id">ID: ${job.id}<span class="delayed-badge" style="background: #4facfe;">Processing</span></div>
+                        <div class="job-actions">
+                            <span class="delayed-badge" style="background: #667eea;">Priority ${priority}</span>
+                        </div>
+                    </div>
+                    <div class="job-payload">${JSON.stringify(job.payload, null, 2)}</div>
+                    <div class="job-meta">
+                        <div>⚙️ Visibility timeout expires at: ${visibleAt}</div>
+                        <div style="margin-top: 4px;">🚚 Picked up at: ${pickedUpAt}</div>
+                        <div style="margin-top: 4px;">🔄 Current retry count: ${job.retry_count || 0}</div>
+                    </div>
                 </div>
             `;
         }
@@ -540,11 +588,13 @@
                    </details>`
                 : '';
             
+            const priority = job.priority || 3;
             return `
                 <div class="job-item dead-letter">
                     <div class="job-header">
                         <div class="job-id">ID: ${job.id}<span class="error-badge">Failed after ${job.retry_count} attempts</span></div>
                         <div class="job-actions">
+                            <span class="delayed-badge" style="background: #667eea; margin-right: 8px;">Priority ${priority}</span>
                             <button class="btn btn-success btn-small" onclick="replayJob('${job.id}')">🔄 Replay</button>
                         </div>
                     </div>

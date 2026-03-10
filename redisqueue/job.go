@@ -18,25 +18,39 @@ type JobError struct {
 
 // Job represents a unit of work to be processed.
 type Job struct {
-	ID         string          `json:"id"`
-	Type       string          `json:"type"`
-	Payload    json.RawMessage `json:"payload"`
-	RetryCount int             `json:"retry_count,omitempty"`
-	MaxRetries int             `json:"max_retries,omitempty"`
-	Errors     []JobError      `json:"errors,omitempty"`
+	ID          string          `json:"id"`
+	Type        string          `json:"type"`
+	Payload     json.RawMessage `json:"payload"`
+	RetryCount  int             `json:"retry_count,omitempty"`
+	MaxRetries  int             `json:"max_retries,omitempty"`
+	Priority    int             `json:"priority,omitempty"`
+	PickedUpAt  string          `json:"picked_up_at,omitempty"`
+	Errors      []JobError      `json:"errors,omitempty"`
+	rawJSON     string          `json:"-"` // Internal field to track original JSON for removal from processing set
 }
 
+// DefaultPriority is the default priority value for jobs (lower number = higher priority).
+const DefaultPriority = 3
+
 // NewJob creates a new Job with a unique ID and optional max retries.
-func NewJob(jobType string, payload any, maxRetries int) (*Job, error) {
+// Priority defaults to DefaultPriority (3) if not specified or invalid.
+func NewJob(jobType string, payload any, maxRetries int, priority int) (*Job, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal job payload: %w", err)
 	}
+
+	// Use default priority if invalid (0 or negative)
+	if priority <= 0 {
+		priority = DefaultPriority
+	}
+
 	return &Job{
 		ID:         uuid.New().String(),
 		Type:       jobType,
 		Payload:    payloadBytes,
 		MaxRetries: maxRetries,
+		Priority:   priority,
 	}, nil
 }
 
@@ -88,13 +102,13 @@ func NewJobQueue(client *RedisQueue, jobType string, handler Handler) *JobQueue 
 	}
 }
 
-// EnqueueJob serializes and adds a job to the queue.
+// EnqueueJob serializes and adds a job to the queue with its priority.
 func (q *JobQueue) EnqueueJob(ctx context.Context, job *Job) error {
 	jobBytes, err := json.Marshal(job)
 	if err != nil {
 		return fmt.Errorf("failed to marshal job: %w", err)
 	}
-	return q.Enqueue(ctx, string(jobBytes))
+	return q.Enqueue(ctx, string(jobBytes), job.Priority)
 }
 
 // DequeueJob removes and deserializes a job from the queue.
@@ -107,6 +121,8 @@ func (q *JobQueue) DequeueJob(ctx context.Context) (*Job, error) {
 	if err := json.Unmarshal([]byte(data), &job); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal job: %w", err)
 	}
+	// Store the original JSON for later removal from processing set
+	job.rawJSON = data
 	return &job, nil
 }
 
@@ -145,11 +161,49 @@ func (q *JobQueue) Process(ctx context.Context) error {
 
 // CompleteJob marks a job as successfully completed.
 func (q *JobQueue) CompleteJob(ctx context.Context, job *Job) error {
-	jobBytes, err := json.Marshal(job)
-	if err != nil {
-		return fmt.Errorf("failed to marshal job for completion: %w", err)
+	// Use the original JSON if available (for jobs from processing set)
+	// Otherwise, marshal the current job state
+	var jobBytes string
+	if job.rawJSON != "" {
+		jobBytes = job.rawJSON
+	} else {
+		bytes, err := json.Marshal(job)
+		if err != nil {
+			return fmt.Errorf("failed to marshal job for completion: %w", err)
+		}
+		jobBytes = string(bytes)
 	}
-	return q.Complete(ctx, string(jobBytes))
+	return q.Complete(ctx, jobBytes)
+}
+
+// UpdateJobInProcessing updates the job in the processing set with its current state.
+// This is used to update metadata like PickedUpAt after the job has been dequeued.
+func (q *JobQueue) UpdateJobInProcessing(ctx context.Context, job *Job) error {
+	if job.rawJSON == "" {
+		return fmt.Errorf("cannot update job: rawJSON not set (job was not dequeued)")
+	}
+
+	// Marshal the updated job
+	updatedBytes, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated job: %w", err)
+	}
+
+	// Get the current expiration time from the processing set
+	processingKey := q.GetProcessingKey()
+	score, err := q.GetClient().ZScore(ctx, processingKey, job.rawJSON).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get job expiration from processing set: %w", err)
+	}
+
+	// Update the job in the processing set
+	if err := q.UpdateProcessingJob(ctx, job.rawJSON, string(updatedBytes), time.Unix(0, int64(score))); err != nil {
+		return err
+	}
+
+	// Update the rawJSON to the new value for future operations
+	job.rawJSON = string(updatedBytes)
+	return nil
 }
 
 

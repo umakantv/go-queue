@@ -15,7 +15,6 @@ import (
 type WorkerConfig struct {
 	Concurrency    int           // Number of concurrent goroutines per job type
 	PollInterval   time.Duration // Interval between polling attempts
-	RetryOnErr     bool          // Whether to retry failed jobs
 	RetryDelay     time.Duration // Delay before retrying a failed job
 	DelayBatchSize int64         // Max jobs to promote from delayed queue per tick
 }
@@ -25,7 +24,6 @@ func DefaultWorkerConfig() WorkerConfig {
 	return WorkerConfig{
 		Concurrency:    1,
 		PollInterval:   100 * time.Millisecond,
-		RetryOnErr:     false,
 		RetryDelay:     1 * time.Second,
 		DelayBatchSize: 50,
 	}
@@ -151,7 +149,7 @@ func (w *Worker) promoteExpiredProcessingJobs(ctx context.Context, queue *JobQue
 			maxAttempts = 0
 		}
 
-		if attempt > maxAttempts {
+		if attempt >= maxAttempts {
 			// Move to dead letter queue
 			if err := queue.RemoveFromSet(ctx, key, member); err != nil {
 				log.Printf("[ProcessingPromoter/%s] failed to remove expired processing job: %v", queue.GetJobType(), err)
@@ -161,7 +159,7 @@ func (w *Worker) promoteExpiredProcessingJobs(ctx context.Context, queue *JobQue
 				log.Printf("[ProcessingPromoter/%s] failed to move job %s to dead-letter queue: %v", queue.GetJobType(), job.ID, err)
 				continue
 			}
-			log.Printf("[ProcessingPromoter/%s] job %s exceeded max retries (%d), moved to dead-letter queue", queue.GetJobType(), job.ID, maxAttempts)
+			log.Printf("[ProcessingPromoter/%s] job %s reached max attempts (%d), moved to dead-letter queue", queue.GetJobType(), job.ID, maxAttempts)
 			continue
 		}
 
@@ -177,7 +175,7 @@ func (w *Worker) promoteExpiredProcessingJobs(ctx context.Context, queue *JobQue
 			log.Printf("[ProcessingPromoter/%s] failed to remove expired processing job: %v", queue.GetJobType(), err)
 			continue
 		}
-		if err := queue.Enqueue(ctx, string(updatedMember)); err != nil {
+		if err := queue.Enqueue(ctx, string(updatedMember), job.Priority); err != nil {
 			log.Printf("[ProcessingPromoter/%s] failed to requeue expired processing job: %v", queue.GetJobType(), err)
 			continue
 		}
@@ -224,6 +222,14 @@ func (w *Worker) run(ctx context.Context, jobType string, workerID int) {
 
 			// Process the job with optional retry
 			log.Printf("[Worker-%d/%s] picked up job %s (retry count: %d)", workerID, jobType, job.ID, job.RetryCount)
+			job.PickedUpAt = time.Now().UTC().Format(time.RFC3339Nano)
+
+			// Update the job in the processing set with the PickedUpAt time
+			if err := queue.UpdateJobInProcessing(ctx, job); err != nil {
+				log.Printf("[Worker-%d/%s] warning: failed to update job in processing set: %v", workerID, jobType, err)
+				// Continue processing even if update fails
+			}
+
 			w.processWithRetry(ctx, job, handler, queue, workerID)
 		}
 	}
@@ -253,22 +259,22 @@ func (w *Worker) processWithRetry(ctx context.Context, job *Job, handler Handler
 		log.Printf("[Worker-%d] failed to remove job %s from processing set after error: %v", workerID, job.ID, err)
 	}
 
-	if attempt > maxAttempts {
-		if err := w.enqueueDeadLetter(ctx, queue, job); err != nil {
-			log.Printf("[Worker-%d] failed to enqueue job %s to dead-letter queue: %v", workerID, job.ID, err)
-		}
-		log.Printf("[Worker-%d] job %s (type: %s) failed after %d attempts: %v",
-			workerID, job.ID, job.Type, attempt, err)
-		return
-	}
-
-	if w.config.RetryOnErr {
+	// Retry the job if we haven't reached max attempts
+	// Jobs with maxRetries=0 or 1 will not retry and go directly to dead letter
+	if attempt < maxAttempts {
 		if err := w.enqueueDelayedRetry(ctx, queue, job); err != nil {
 			log.Printf("[Worker-%d] failed to enqueue retry for job %s: %v", workerID, job.ID, err)
 			return
 		}
 		log.Printf("[Worker-%d] job %s failed (attempt %d/%d): %v, queued for retry",
 			workerID, job.ID, attempt, maxAttempts, err)
+	} else {
+		// Max attempts reached, move to dead letter queue
+		if err := w.enqueueDeadLetter(ctx, queue, job); err != nil {
+			log.Printf("[Worker-%d] failed to enqueue job %s to dead-letter queue: %v", workerID, job.ID, err)
+		}
+		log.Printf("[Worker-%d] job %s (type: %s) failed after %d attempts: %v",
+			workerID, job.ID, job.Type, attempt, err)
 	}
 }
 
@@ -318,11 +324,19 @@ func (w *Worker) promoteReadyJobs(ctx context.Context, queue *JobQueue) error {
 	}
 
 	for _, member := range members {
+		// Parse the job to get its priority for re-enqueueing
+		var job Job
+		if err := json.Unmarshal([]byte(member), &job); err != nil {
+			log.Printf("[Promoter/%s] failed to unmarshal delayed job for priority: %v", queue.GetJobType(), err)
+			// Fallback to default priority if unmarshal fails
+			job.Priority = DefaultPriority
+		}
+
 		if err := queue.RemoveFromSet(ctx, key, member); err != nil {
 			log.Printf("[Promoter/%s] failed to remove delayed job: %v", queue.GetJobType(), err)
 			continue
 		}
-		if err := queue.Enqueue(ctx, member); err != nil {
+		if err := queue.Enqueue(ctx, member, job.Priority); err != nil {
 			log.Printf("[Promoter/%s] failed to requeue delayed job: %v", queue.GetJobType(), err)
 			continue
 		}

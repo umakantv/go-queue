@@ -29,19 +29,25 @@ func (q *RedisQueue) SetVisibilityTimeout(timeout time.Duration) {
 	q.visibilityTimeout = timeout
 }
 
-// Enqueue adds a value to the end of the queue.
-func (q *RedisQueue) Enqueue(ctx context.Context, value string) error {
-	return q.client.RPush(ctx, q.queueName, value).Err()
+// Enqueue adds a value to the queue with a priority score.
+// Lower scores indicate higher priority.
+func (q *RedisQueue) Enqueue(ctx context.Context, value string, priority int) error {
+	return q.client.ZAdd(ctx, q.queueName, redis.Z{
+		Score:  float64(priority),
+		Member: value,
+	}).Err()
 }
 
-// Dequeue removes and returns a value from the front of the queue.
+// Dequeue removes and returns the highest priority value from the queue.
 // It uses a processing set (Sorted Set) to handle visibility timeouts.
 func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
-	// Atomically pop from list and add to processing sorted set
-	// Using a Lua script to ensure atomicity
+	// Atomically pop the member with the lowest score (highest priority)
+	// and add it to the processing sorted set.
+	// Using a Lua script to ensure atomicity.
 	script := `
-		local val = redis.call('LPOP', KEYS[1])
+		local val = redis.call('ZRANGE', KEYS[1], 0, 0)[1]
 		if val then
+			redis.call('ZREM', KEYS[1], val)
 			redis.call('ZADD', KEYS[2], ARGV[1], val)
 		end
 		return val
@@ -88,7 +94,7 @@ func (q *RedisQueue) DequeueWithTimeout(ctx context.Context, timeout time.Durati
 
 // Size returns the number of elements in the queue.
 func (q *RedisQueue) Size(ctx context.Context) (int64, error) {
-	return q.client.LLen(ctx, q.queueName).Result()
+	return q.client.ZCard(ctx, q.queueName).Result()
 }
 
 // Clear removes all elements from the queue.
@@ -99,7 +105,7 @@ func (q *RedisQueue) Clear(ctx context.Context) error {
 // Peek returns elements from the queue without removing them.
 // start and stop are 0-based indices. Use -1 for the last element.
 func (q *RedisQueue) Peek(ctx context.Context, start, stop int64) ([]string, error) {
-	return q.client.LRange(ctx, q.queueName, start, stop).Result()
+	return q.client.ZRange(ctx, q.queueName, start, stop).Result()
 }
 
 // GetQueueName returns the name of the queue.
@@ -115,6 +121,31 @@ func (q *RedisQueue) GetClient() *redis.Client {
 // RemoveFromSet removes a member from a sorted set key.
 func (q *RedisQueue) RemoveFromSet(ctx context.Context, key string, member string) error {
 	return q.client.ZRem(ctx, key, member).Err()
+}
+
+// UpdateProcessingJob updates a job in the processing set with new JSON.
+// It removes the old member (by rawJSON) and adds the new member with the same expiration time.
+func (q *RedisQueue) UpdateProcessingJob(ctx context.Context, oldJSON, newJSON string, expiration time.Time) error {
+	processingKey := q.GetProcessingKey()
+
+	// Use a Lua script to atomically remove old and add new
+	script := `
+		local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+		if score then
+			redis.call('ZREM', KEYS[1], ARGV[1])
+			redis.call('ZADD', KEYS[1], score, ARGV[2])
+			return 1
+		end
+		return 0
+	`
+	result, err := q.client.Eval(ctx, script, []string{processingKey}, oldJSON, newJSON).Result()
+	if err != nil {
+		return fmt.Errorf("failed to update processing job: %w", err)
+	}
+	if result.(int64) == 0 {
+		return fmt.Errorf("job not found in processing set")
+	}
+	return nil
 }
 
 // AddToSet adds a member to a sorted set key with a score.

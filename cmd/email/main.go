@@ -27,7 +27,6 @@ func main() {
 	// Worker config flags
 	concurrency := flag.Int("concurrency", 1, "Number of concurrent workers")
 	pollInterval := flag.Duration("poll-interval", 100*time.Millisecond, "Interval between polling attempts")
-	retry := flag.Bool("retry", false, "Enable retry for failed jobs")
 	retryDelay := flag.Duration("retry-delay", 1*time.Second, "Delay before retrying a failed job")
 	flag.Parse()
 
@@ -79,13 +78,12 @@ func main() {
 	config := redisqueue.WorkerConfig{
 		Concurrency:  *concurrency,
 		PollInterval: *pollInterval,
-		RetryOnErr:   *retry,
 		RetryDelay:   *retryDelay,
 	}
 	worker := redisqueue.NewWorkerWithConfig(registry, config)
 
-	log.Printf("Email worker started with config: concurrency=%d, poll-interval=%v, retry=%v, retry-delay=%v",
-		config.Concurrency, config.PollInterval, config.RetryOnErr, config.RetryDelay)
+	log.Printf("Email worker started with config: concurrency=%d, poll-interval=%v, retry-delay=%v",
+		config.Concurrency, config.PollInterval, config.RetryDelay)
 
 	log.Println("Waiting for jobs...")
 

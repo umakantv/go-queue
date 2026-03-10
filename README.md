@@ -5,6 +5,7 @@ A Redis-based Golang package to manage a queue system, supporting multiple confi
 ## Features
 
 - **Multiple Job Types**: Support for different job types with dedicated Redis queues
+- **Job Priorities**: Jobs can be assigned priority levels (1, 2, 3...), where lower numbers indicate higher priority (default: 3)
 - **Built-in Concurrency**: Workers use goroutines for parallel job processing
 - **Real-time Dashboard**: SSE-enabled dashboard displaying queue stats and pending tasks
 - **Non-Blocking Retries**: Failed jobs are re-queued to a delayed queue using Redis sorted sets, allowing workers to remain available
@@ -67,6 +68,12 @@ go get github.com/umakantv/redis-queue
    # Create prepare-report jobs (long-running)
    go run ./cmd/producer -type prepare-report -count 2
    
+   # Create high-priority jobs (priority 1 = highest)
+   go run ./cmd/producer -type email -count 3 -priority 1
+   
+   # Create low-priority jobs (priority 5 = lower than default)
+   go run ./cmd/producer -type download -count 5 -priority 5
+   
    # List pending jobs
    go run ./cmd/producer -list
    ```
@@ -79,13 +86,66 @@ Workers support the following command-line flags:
 |------|---------|-------------|
 | `-concurrency` | 1 | Number of concurrent worker goroutines |
 | `-poll-interval` | 100ms | Interval between polling attempts |
-| `-retry` | false | Enable retry for failed jobs |
 | `-retry-delay` | 1s | Delay before retrying a failed job |
 
 
 Example:
 ```bash
-go run ./cmd/email -concurrency 4 -retry -max-retries 5 -retry-delay 2s
+go run ./cmd/email -concurrency 4 -retry-delay 2s
+```
+
+## Job Priorities
+
+Jobs can be assigned a priority level using positive integers. Lower numbers indicate higher priority.
+
+- **Priority 1**: Highest priority (processed first)
+- **Priority 2**: High priority
+- **Priority 3**: Normal priority (default)
+- **Priority 4+**: Lower priority (processed after higher priority jobs)
+
+### Setting Priority via API
+
+When creating a job via the REST API, include the `priority` field:
+
+```bash
+# Create a high-priority email job (priority 1)
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "priority": 1,
+    "payload": {
+      "to": "urgent@example.com",
+      "subject": "Urgent: Action Required",
+      "body": "This is a high-priority message!"
+    }
+  }'
+```
+
+### Setting Priority via Producer
+
+Use the `-priority` flag when running the producer:
+
+```bash
+# Create 5 high-priority jobs
+go run ./cmd/producer -type email -count 5 -priority 1
+
+# Create 3 low-priority jobs
+go run ./cmd/producer -type download -count 3 -priority 5
+```
+
+### Priority in Job Structure
+
+When creating jobs programmatically:
+
+```go
+import redisqueue "github.com/umakantv/redis-queue/redisqueue"
+
+// Create a high-priority job
+job, err := registry.Enqueue(ctx, "email", payload, 3, 1) // maxRetries=3, priority=1
+
+// Create a job with default priority
+job, err := registry.Enqueue(ctx, "email", payload, 3, 0) // 0 uses default (3)
 ```
 
 ## Queue Architecture
@@ -135,12 +195,17 @@ go run ./cmd/email -concurrency 4 -retry -max-retries 5 -retry-delay 2s
 
 ### Non-Blocking Retry Mechanism
 
-When a job fails and retries are enabled:
+When a job fails and has `max_retries` > 0:
 
 1. The job is **immediately** re-enqueued to the delayed queue (sorted set) with a timestamp score
 2. The worker **does not block** - it's immediately available to process other jobs
 3. A separate promoter goroutine moves ready jobs back to the main queue when the delay expires
 4. This ensures **full worker utilization** even during retry periods
+
+**Retry Behavior:**
+- Jobs with `max_retries: 0` (default) will not retry and go directly to the dead-letter queue on failure
+- Jobs with `max_retries: N` will be retried up to N times before moving to dead-letter queue
+- The retry delay is controlled by the worker's `-retry-delay` flag (default: 1s)
 
 ### Dead-Letter Queue
 
@@ -190,6 +255,7 @@ Create a new job and insert it into the specified queue.
 | `queue` | string | Yes | Queue name (job type): `email`, `download`, or `prepare-report` |
 | `id` | string | No | Custom job ID (auto-generated if omitted) |
 | `max_retries` | integer | No | Maximum number of retries (default: 0) |
+| `priority` | integer | No | Job priority - lower is higher (default: 3) |
 | `payload` | object | Yes | Job payload data |
 
 
@@ -199,6 +265,7 @@ Create a new job and insert it into the specified queue.
   "id": "1709564234567890123",
   "type": "email",
   "queue": "queue:email",
+  "priority": 3,
   "payload": {
     "to": "user@example.com",
     "subject": "Hello",
@@ -218,6 +285,20 @@ curl -X POST http://localhost:8080/api/jobs \
       "to": "user@example.com",
       "subject": "Welcome",
       "body": "Welcome to our service!"
+    }
+  }'
+
+# Create a high-priority email job
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "priority": 1,
+    "max_retries": 3,
+    "payload": {
+      "to": "urgent@example.com",
+      "subject": "Urgent",
+      "body": "High priority message!"
     }
   }'
 
@@ -339,17 +420,26 @@ Environment variables:
 The producer script simulates job failures for email jobs containing "error" in the email address. This allows testing of retry logic:
 
 ```bash
-# This will create an email job that will fail
+# Create an email job that will fail and be retried 2 times
 curl -X POST http://localhost:8080/api/jobs \
   -H "Content-Type: application/json" \
   -d '{
     "queue": "email",
+    "max_retries": 2,
     "payload": {
       "to": "usererror@example.com",
       "subject": "Test Retry",
       "body": "This job will fail for testing"
     }
   }'
+```
+
+Or using the producer command:
+
+```bash
+# Create 5 email jobs with 2 retries each
+# Jobs with "error" in the email address will fail and be retried
+go run ./cmd/producer -type email -count 5 -max-retries 2
 ```
 
 ## License
