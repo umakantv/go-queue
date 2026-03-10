@@ -63,6 +63,8 @@ func (w *Worker) StartPromoters(ctx context.Context, jobType string) {
 	w.wg.Add(1)
 	go w.promoteDelayed(ctx, jobType)
 	w.wg.Add(1)
+	go w.promoteScheduled(ctx, jobType)
+	w.wg.Add(1)
 	go w.promoteProcessing(ctx, jobType)
 	log.Printf("Started promoters for job type %q", jobType)
 }
@@ -301,16 +303,44 @@ func (w *Worker) promoteDelayed(ctx context.Context, jobType string) {
 			log.Printf("[Promoter/%s] context cancelled", jobType)
 			return
 		case <-ticker.C:
-			if err := w.promoteReadyJobs(ctx, queue); err != nil {
+			if err := w.promoteReadyJobs(ctx, queue, queue.DelayedQueueName(), "delayed job"); err != nil {
 				log.Printf("[Promoter/%s] error promoting delayed jobs: %v", jobType, err)
 			}
 		}
 	}
 }
 
-// promoteReadyJobs moves ready jobs from delayed queue to main queue.
-func (w *Worker) promoteReadyJobs(ctx context.Context, queue *JobQueue) error {
-	key := w.delayedQueueName(queue.GetQueueName())
+// promoteScheduled moves ready jobs from the scheduled queue to the main queue.
+func (w *Worker) promoteScheduled(ctx context.Context, jobType string) {
+	defer w.wg.Done()
+
+	queue, ok := w.registry.GetQueue(jobType)
+	if !ok {
+		log.Printf("[ScheduledPromoter/%s] queue not found", jobType)
+		return
+	}
+
+	ticker := time.NewTicker(w.config.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.stopCh:
+			log.Printf("[ScheduledPromoter/%s] stopping", jobType)
+			return
+		case <-ctx.Done():
+			log.Printf("[ScheduledPromoter/%s] context cancelled", jobType)
+			return
+		case <-ticker.C:
+			if err := w.promoteReadyJobs(ctx, queue, queue.ScheduledQueueName(), "scheduled job"); err != nil {
+				log.Printf("[ScheduledPromoter/%s] error promoting scheduled jobs: %v", jobType, err)
+			}
+		}
+	}
+}
+
+// promoteReadyJobs moves ready jobs from the given queue key to the main queue.
+func (w *Worker) promoteReadyJobs(ctx context.Context, queue *JobQueue, key string, jobLabel string) error {
 	now := time.Now().UnixNano()
 
 	batchSize := w.config.DelayBatchSize
@@ -327,17 +357,17 @@ func (w *Worker) promoteReadyJobs(ctx context.Context, queue *JobQueue) error {
 		// Parse the job to get its priority for re-enqueueing
 		var job Job
 		if err := json.Unmarshal([]byte(member), &job); err != nil {
-			log.Printf("[Promoter/%s] failed to unmarshal delayed job for priority: %v", queue.GetJobType(), err)
+			log.Printf("[Promoter/%s] failed to unmarshal %s for priority: %v", queue.GetJobType(), jobLabel, err)
 			// Fallback to default priority if unmarshal fails
 			job.Priority = DefaultPriority
 		}
 
 		if err := queue.RemoveFromSet(ctx, key, member); err != nil {
-			log.Printf("[Promoter/%s] failed to remove delayed job: %v", queue.GetJobType(), err)
+			log.Printf("[Promoter/%s] failed to remove %s: %v", queue.GetJobType(), jobLabel, err)
 			continue
 		}
 		if err := queue.Enqueue(ctx, member, job.Priority); err != nil {
-			log.Printf("[Promoter/%s] failed to requeue delayed job: %v", queue.GetJobType(), err)
+			log.Printf("[Promoter/%s] failed to requeue %s: %v", queue.GetJobType(), jobLabel, err)
 			continue
 		}
 	}
@@ -347,7 +377,7 @@ func (w *Worker) promoteReadyJobs(ctx context.Context, queue *JobQueue) error {
 
 // enqueueDelayedRetry adds a job to the delayed retry sorted set.
 func (w *Worker) enqueueDelayedRetry(ctx context.Context, queue *JobQueue, job *Job) error {
-	key := w.delayedQueueName(queue.GetQueueName())
+	key := queue.DelayedQueueName()
 	executeAt := time.Now().Add(w.config.RetryDelay).UnixNano()
 
 	payload, err := json.Marshal(job)
@@ -366,10 +396,6 @@ func (w *Worker) enqueueDeadLetter(ctx context.Context, queue *JobQueue, job *Jo
 		return fmt.Errorf("failed to marshal dead-letter job: %w", err)
 	}
 	return queue.GetClient().RPush(ctx, key, payload).Err()
-}
-
-func (w *Worker) delayedQueueName(queueName string) string {
-	return fmt.Sprintf("%s:delayed", queueName)
 }
 
 func (w *Worker) deadLetterQueueName(queueName string) string {

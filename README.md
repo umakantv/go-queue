@@ -6,6 +6,7 @@ A Redis-based Golang package to manage a queue system, supporting multiple confi
 
 - **Multiple Job Types**: Support for different job types with dedicated Redis queues
 - **Job Priorities**: Jobs can be assigned priority levels (1, 2, 3...), where lower numbers indicate higher priority (default: 3)
+- **Scheduled Jobs**: Jobs can be scheduled for future execution using the `start_at` field
 - **Built-in Concurrency**: Workers use goroutines for parallel job processing
 - **Real-time Dashboard**: SSE-enabled dashboard displaying queue stats and pending tasks
 - **Non-Blocking Retries**: Failed jobs are re-queued to a delayed queue using Redis sorted sets, allowing workers to remain available
@@ -74,6 +75,10 @@ go get github.com/umakantv/redis-queue
    # Create low-priority jobs (priority 5 = lower than default)
    go run ./cmd/producer -type download -count 5 -priority 5
    
+   # Schedule jobs with a delay
+   go run ./cmd/producer -type email -count 2 -delay 30s
+   go run ./cmd/producer -type prepare-report -count 1 -delay 2h3m10s
+   
    # List pending jobs
    go run ./cmd/producer -list
    ```
@@ -134,6 +139,77 @@ go run ./cmd/producer -type email -count 5 -priority 1
 go run ./cmd/producer -type download -count 3 -priority 5
 ```
 
+## Scheduled Jobs
+
+Jobs can be scheduled for future execution by specifying a `start_at` timestamp in RFC3339 format. The job will be held in a delayed queue until the scheduled time, then promoted to the main queue for processing.
+
+### Scheduling via API
+
+When creating a job via the REST API, include the `start_at` field:
+
+```bash
+# Schedule an email job to run at a specific time
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-12-25T09:00:00Z",
+    "payload": {
+      "to": "user@example.com",
+      "subject": "Holiday Greeting",
+      "body": "Happy Holidays!"
+    }
+  }'
+
+# Schedule a report job to run in 30 minutes
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "prepare-report",
+    "start_at": "2024-01-15T14:30:00Z",
+    "payload": {
+      "report_type": "daily_summary",
+      "start_date": "2024-01-14",
+      "end_date": "2024-01-14"
+    }
+  }'
+```
+
+### Scheduling Programmatically
+
+When creating jobs programmatically:
+
+```go
+import redisqueue "github.com/umakantv/redis-queue/redisqueue"
+
+// Schedule a job for future execution
+scheduledTime := "2024-12-25T09:00:00Z"
+job, err := registry.Enqueue(ctx, "email", payload, 3, 1, scheduledTime)
+// maxRetries=3, priority=1, startAt=scheduledTime
+
+// Create an immediate job (empty startAt)
+job, err := registry.Enqueue(ctx, "email", payload, 3, 0, "")
+```
+
+### Scheduling via Producer
+
+Use the `-delay` flag with Go duration syntax (`30s`, `5m`, `2h3m10s`):
+
+```bash
+# Schedule an email job for 1 minute later
+go run ./cmd/producer -type email -count 1 -delay 1m
+
+# Schedule a report job for 2 hours and 3 minutes later
+go run ./cmd/producer -type prepare-report -count 1 -delay 2h3m
+```
+
+### How Scheduled Jobs Work
+
+1. When a job with `start_at` is created, it's placed in the delayed queue with the timestamp as the score
+2. The broker's promoter goroutine periodically checks the delayed queue
+3. When `start_at` time is reached, the job is promoted to the main queue
+4. Workers pick up the job from the main queue and process it normally
+
 ### Priority in Job Structure
 
 When creating jobs programmatically:
@@ -142,10 +218,10 @@ When creating jobs programmatically:
 import redisqueue "github.com/umakantv/redis-queue/redisqueue"
 
 // Create a high-priority job
-job, err := registry.Enqueue(ctx, "email", payload, 3, 1) // maxRetries=3, priority=1
+job, err := registry.Enqueue(ctx, "email", payload, 3, 1, "") // maxRetries=3, priority=1, startAt="" (immediate)
 
 // Create a job with default priority
-job, err := registry.Enqueue(ctx, "email", payload, 3, 0) // 0 uses default (3)
+job, err := registry.Enqueue(ctx, "email", payload, 3, 0, "") // 0 uses default (3)
 ```
 
 ## Queue Architecture
@@ -224,7 +300,9 @@ Jobs that fail after reaching the maximum retry count are moved to the dead-lett
 | `/api/queues` | GET | List all queues with stats (pending, delayed, dead) |
 | `/api/queue/{type}` | GET | Get pending jobs for a specific queue |
 | `/api/jobs` | POST | Create a new job |
-| `/api/delayed/{type}` | GET | List delayed jobs with execution times |
+| `/api/delayed/{type}` | GET | List delayed retry jobs with execution times |
+| `/api/scheduled/{type}` | GET | List scheduled jobs with start times |
+| `/api/scheduled-delete/{type}/{id}` | DELETE | Delete a scheduled job |
 | `/api/dead-letter/{type}` | GET | List dead-letter jobs with error history |
 | `/api/dead-letter/{type}` | DELETE | Clear all dead-letter jobs |
 | `/api/replay-job/{type}/{id}` | POST | Replay a dead-letter job |
@@ -256,6 +334,7 @@ Create a new job and insert it into the specified queue.
 | `id` | string | No | Custom job ID (auto-generated if omitted) |
 | `max_retries` | integer | No | Maximum number of retries (default: 0) |
 | `priority` | integer | No | Job priority - lower is higher (default: 3) |
+| `start_at` | string | No | Scheduled execution time in RFC3339 format (e.g., `2024-12-25T09:00:00Z`) |
 | `payload` | object | Yes | Job payload data |
 
 
@@ -266,6 +345,7 @@ Create a new job and insert it into the specified queue.
   "type": "email",
   "queue": "queue:email",
   "priority": 3,
+  "start_at": "2024-12-25T09:00:00Z",
   "payload": {
     "to": "user@example.com",
     "subject": "Hello",
@@ -299,6 +379,19 @@ curl -X POST http://localhost:8080/api/jobs \
       "to": "urgent@example.com",
       "subject": "Urgent",
       "body": "High priority message!"
+    }
+  }'
+
+# Create a scheduled job
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-12-25T09:00:00Z",
+    "payload": {
+      "to": "user@example.com",
+      "subject": "Scheduled Message",
+      "body": "This will be sent at the scheduled time"
     }
   }'
 

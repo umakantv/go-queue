@@ -20,6 +20,9 @@ Content-Type: application/json
 {
   "queue": "<job_type>",
   "id": "<optional_custom_id>",
+  "priority": "<optional_priority>",
+  "max_retries": "<optional_max_retries>",
+  "start_at": "<optional_scheduled_time>",
   "payload": { ... }
 }
 ```
@@ -30,6 +33,9 @@ Content-Type: application/json
 |-------|------|----------|-------------|
 | `queue` | string | Yes | The queue name (job type): `email` or `download` |
 | `id` | string | No | Custom job ID (auto-generated if omitted) |
+| `priority` | integer | No | Job priority - lower is higher (default: 3) |
+| `max_retries` | integer | No | Maximum number of retries (default: 0) |
+| `start_at` | string | No | Scheduled execution time in RFC3339 format |
 | `payload` | object | Yes | Job payload data |
 
 ## Success Response
@@ -41,6 +47,8 @@ Content-Type: application/json
   "id": "1709564234567890123",
   "type": "email",
   "queue": "queue:email",
+  "priority": 3,
+  "start_at": "2024-12-25T09:00:00Z",
   "payload": {
     "to": "user@example.com",
     "subject": "Welcome",
@@ -126,6 +134,111 @@ curl -X POST http://localhost:8080/api/jobs \
       "filename": "annual-report-2024.pdf"
     }
   }'
+```
+
+## Scheduled Jobs
+
+Jobs can be scheduled for future execution by specifying a `start_at` timestamp in RFC3339 format. The job will be held in a delayed queue until the scheduled time, then promoted to the main queue for processing.
+
+### Create a Scheduled Email Job
+
+```bash
+# Schedule an email to be sent at a specific time
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-12-25T09:00:00Z",
+    "payload": {
+      "to": "user@example.com",
+      "subject": "Holiday Greeting",
+      "body": "Happy Holidays!"
+    }
+  }'
+```
+
+### Create a Scheduled Job with Priority and Retries
+
+```bash
+# Schedule a high-priority job with retry support
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "priority": 1,
+    "max_retries": 3,
+    "start_at": "2024-01-15T14:30:00Z",
+    "payload": {
+      "to": "important@example.com",
+      "subject": "Scheduled Report",
+      "body": "This is a scheduled high-priority email"
+    }
+  }'
+```
+
+### Create a Scheduled Report Job
+
+```bash
+# Schedule a report generation for off-peak hours
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "prepare-report",
+    "start_at": "2024-01-16T02:00:00Z",
+    "payload": {
+      "report_type": "daily_summary",
+      "start_date": "2024-01-15",
+      "end_date": "2024-01-15"
+    }
+  }'
+```
+
+### Calculate Future Timestamp
+
+You can use shell commands to calculate a future timestamp:
+
+```bash
+# Schedule a job for 30 minutes from now
+START_AT=$(date -u -d "+30 minutes" +"%Y-%m-%dT%H:%M:%SZ")
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"queue\": \"email\",
+    \"start_at\": \"$START_AT\",
+    \"payload\": {
+      \"to\": \"user@example.com\",
+      \"subject\": \"Reminder\",
+      \"body\": \"This is a reminder email\"
+    }
+  }"
+
+# Schedule a job for tomorrow at 9 AM UTC
+START_AT=$(date -u -d "tomorrow 09:00" +"%Y-%m-%dT%H:%M:%SZ")
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"queue\": \"email\",
+    \"start_at\": \"$START_AT\",
+    \"payload\": {
+      \"to\": \"user@example.com\",
+      \"subject\": \"Daily Report\",
+      \"body\": \"Here is your daily report\"
+    }
+  }"
+```
+
+### How Scheduled Jobs Work
+
+1. When a job with `start_at` is created, it's placed in the delayed queue with the timestamp as the score
+2. The broker's promoter goroutine periodically checks the delayed queue
+3. When `start_at` time is reached, the job is promoted to the main queue
+4. Workers pick up the job from the main queue and process it normally
+
+### Verify Scheduled Jobs
+
+Check delayed jobs for a queue:
+```bash
+curl http://localhost:8080/api/delayed/email
 ```
 
 ### Create Multiple Jobs

@@ -39,6 +39,7 @@ type CreateJobRequest struct {
 	ID         string      `json:"id,omitempty"`
 	MaxRetries int         `json:"max_retries"`
 	Priority   int         `json:"priority"`
+	StartAt    string      `json:"start_at,omitempty"`
 	Payload    interface{} `json:"payload"`
 }
 
@@ -116,6 +117,7 @@ func main() {
 	count := flag.Int("count", 1, "Number of jobs to create")
 	maxRetries := flag.Int("max-retries", 0, "Maximum number of retries for the jobs (default 0)")
 	priority := flag.Int("priority", 3, "Job priority (default: 3, lower = higher priority)")
+	delay := flag.String("delay", "", "Delay before running the job (e.g. 30s, 5m, 2h3m10s)")
 	list := flag.Bool("list", false, "List pending jobs in queues")
 	serverURL := flag.String("server", getEnv("DASHBOARD_URL", "http://localhost:8080"), "Dashboard server URL")
 	flag.Parse()
@@ -132,9 +134,9 @@ func main() {
 	if *jobType == "" {
 		fmt.Println("Error: -type flag is required")
 		fmt.Println("Usage:")
-		fmt.Println("  producer -type email [-count N] [-max-retries M] [-priority P]         Create N email jobs")
-		fmt.Println("  producer -type download [-count N] [-max-retries M] [-priority P]      Create N download jobs")
-		fmt.Println("  producer -type prepare-report [-count N] [-max-retries M] [-priority P] Create N prepare-report jobs")
+		fmt.Println("  producer -type email [-count N] [-max-retries M] [-priority P] [-delay D]         Create N email jobs")
+		fmt.Println("  producer -type download [-count N] [-max-retries M] [-priority P] [-delay D]      Create N download jobs")
+		fmt.Println("  producer -type prepare-report [-count N] [-max-retries M] [-priority P] [-delay D] Create N prepare-report jobs")
 
 		fmt.Println("  producer -list                          List pending jobs in queues")
 		fmt.Println("  producer -server URL                    Dashboard server URL (default: http://localhost:8080)")
@@ -144,18 +146,27 @@ func main() {
 	// Seed random
 	rand.Seed(time.Now().UnixNano())
 
+	startAt, err := parseDelay(*delay)
+	if err != nil {
+		log.Fatalf("Invalid delay value: %v", err)
+	}
+
 	// Create jobs
 	var created int
 	switch *jobType {
 	case "email":
 		for i := 0; i < *count; i++ {
 			payload := generateEmailPayload()
-			job, err := createJob(*serverURL, "email", payload, *maxRetries, *priority)
+			job, err := createJob(*serverURL, "email", payload, *maxRetries, *priority, startAt)
 			if err != nil {
 				log.Printf("Failed to create email job: %v", err)
 				continue
 			}
-			fmt.Printf("Created email job %s: to=%s, subject=%s, priority=%d\n", job.ID, payload.To, payload.Subject, job.Priority)
+			fmt.Printf("Created email job %s: to=%s, subject=%s, priority=%d", job.ID, payload.To, payload.Subject, job.Priority)
+			if startAt != "" {
+				fmt.Printf(", start_at=%s", startAt)
+			}
+			fmt.Println()
 			created++
 		}
 		fmt.Printf("\nCreated %d email job(s)\n", created)
@@ -163,12 +174,16 @@ func main() {
 	case "download":
 		for i := 0; i < *count; i++ {
 			payload := generateDownloadPayload()
-			job, err := createJob(*serverURL, "download", payload, *maxRetries, *priority)
+			job, err := createJob(*serverURL, "download", payload, *maxRetries, *priority, startAt)
 			if err != nil {
 				log.Printf("Failed to create download job: %v", err)
 				continue
 			}
-			fmt.Printf("Created download job %s: url=%s, filename=%s, priority=%d\n", job.ID, payload.URL, payload.Filename, job.Priority)
+			fmt.Printf("Created download job %s: url=%s, filename=%s, priority=%d", job.ID, payload.URL, payload.Filename, job.Priority)
+			if startAt != "" {
+				fmt.Printf(", start_at=%s", startAt)
+			}
+			fmt.Println()
 			created++
 		}
 		fmt.Printf("\nCreated %d download job(s)\n", created)
@@ -176,12 +191,16 @@ func main() {
 	case "prepare-report":
 		for i := 0; i < *count; i++ {
 			payload := generateReportPayload()
-			job, err := createJob(*serverURL, "prepare-report", payload, *maxRetries, *priority)
+			job, err := createJob(*serverURL, "prepare-report", payload, *maxRetries, *priority, startAt)
 			if err != nil {
 				log.Printf("Failed to create prepare-report job: %v", err)
 				continue
 			}
-			fmt.Printf("Created prepare-report job %s: report_type=%s, start_date=%s, end_date=%s, priority=%d\n", job.ID, payload.ReportType, payload.StartDate, payload.EndDate, job.Priority)
+			fmt.Printf("Created prepare-report job %s: report_type=%s, start_date=%s, end_date=%s, priority=%d", job.ID, payload.ReportType, payload.StartDate, payload.EndDate, job.Priority)
+			if startAt != "" {
+				fmt.Printf(", start_at=%s", startAt)
+			}
+			fmt.Println()
 			created++
 		}
 		fmt.Printf("\nCreated %d prepare-report job(s)\n", created)
@@ -254,12 +273,13 @@ func generateReportPayload() ReportPayload {
 }
 
 // createJob sends a request to the dashboard API to create a job.
-func createJob(serverURL, queue string, payload interface{}, maxRetries int, priority int) (*CreateJobResponse, error) {
+func createJob(serverURL, queue string, payload interface{}, maxRetries int, priority int, startAt string) (*CreateJobResponse, error) {
 	req := CreateJobRequest{
 		Queue:      queue,
 		Payload:    payload,
 		MaxRetries: maxRetries,
 		Priority:   priority,
+		StartAt:    startAt,
 	}
 
 
@@ -332,6 +352,23 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func parseDelay(delay string) (string, error) {
+	if delay == "" {
+		return "", nil
+	}
+
+	duration, err := time.ParseDuration(delay)
+	if err != nil {
+		return "", err
+	}
+
+	if duration <= 0 {
+		return "", fmt.Errorf("delay must be greater than zero")
+	}
+
+	return time.Now().UTC().Add(duration).Format(time.RFC3339), nil
 }
 
 func init() {

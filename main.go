@@ -102,7 +102,7 @@ func main() {
 		{To: "user2@example.com", Subject: "Order Confirmation", Body: "Your order #12345 is confirmed."},
 	}
 	for _, ep := range emailJobs {
-		job, err := registry.Enqueue(ctx, "email", ep, 0, 0) // maxRetries=0, priority=0 (uses default)
+		job, err := registry.Enqueue(ctx, "email", ep, 0, 0, "") // maxRetries=0, priority=0 (uses default), startAt="" (immediate)
 		if err != nil {
 			log.Printf("Failed to enqueue email job: %v", err)
 		} else {
@@ -116,7 +116,7 @@ func main() {
 		{URL: "https://example.com/file2.zip", Filename: "file2.zip"},
 	}
 	for _, dp := range downloadJobs {
-		job, err := registry.Enqueue(ctx, "download", dp, 0, 0) // maxRetries=0, priority=0 (uses default)
+		job, err := registry.Enqueue(ctx, "download", dp, 0, 0, "") // maxRetries=0, priority=0 (uses default), startAt="" (immediate)
 		if err != nil {
 			log.Printf("Failed to enqueue download job: %v", err)
 		} else {

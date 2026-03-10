@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,6 +31,7 @@ type QueueStats struct {
 	Size           int64  `json:"size"`
 	QueueName      string `json:"queue_name"`
 	DelayedSize    int64  `json:"delayed_size"`
+	ScheduledSize  int64  `json:"scheduled_size"`
 	ProcessingSize int64  `json:"processing_size"`
 	DeadLetterSize int64  `json:"dead_letter_size"`
 }
@@ -132,6 +135,8 @@ func main() {
 	http.HandleFunc("/api/dead-letter/", dashboard.handleDeadLetterAPI)
 	http.HandleFunc("/api/replay-job/", dashboard.handleReplayJobAPI)
 	http.HandleFunc("/api/delayed/", dashboard.handleDelayedAPI)
+	http.HandleFunc("/api/scheduled/", dashboard.handleScheduledAPI)
+	http.HandleFunc("/api/scheduled-delete/", dashboard.handleScheduledDeleteAPI)
 	http.HandleFunc("/api/processing/", dashboard.handleProcessingAPI)
 	http.HandleFunc("/events", dashboard.handleSSE)
 
@@ -224,6 +229,7 @@ type CreateJobRequest struct {
 	ID         string                 `json:"id,omitempty"`     // Optional job ID (generated if not provided)
 	MaxRetries int                    `json:"max_retries"`      // Optional max retries
 	Priority   int                    `json:"priority"`         // Optional priority (default: 3, lower = higher priority)
+	StartAt    string                 `json:"start_at"`         // Optional scheduled execution time (RFC3339 format)
 	Payload    map[string]interface{} `json:"payload"`          // Job payload
 }
 
@@ -234,6 +240,7 @@ type CreateJobResponse struct {
 	Type     string                 `json:"type"`
 	Queue    string                 `json:"queue"`
 	Priority int                    `json:"priority"`
+	StartAt  string                 `json:"start_at,omitempty"`
 	Payload  map[string]interface{} `json:"payload"`
 }
 
@@ -274,6 +281,7 @@ func (d *Dashboard) handleCreateJobAPI(w http.ResponseWriter, r *http.Request) {
 		Type:       req.Queue,
 		MaxRetries: req.MaxRetries,
 		Priority:   req.Priority,
+		StartAt:    req.StartAt,
 	}
 
 	// Use default priority if not specified or invalid
@@ -308,6 +316,7 @@ func (d *Dashboard) handleCreateJobAPI(w http.ResponseWriter, r *http.Request) {
 		Type:     job.Type,
 		Queue:    queue.GetQueueName(),
 		Priority: job.Priority,
+		StartAt:  job.StartAt,
 		Payload:  req.Payload,
 	}
 
@@ -425,6 +434,10 @@ func (d *Dashboard) getQueueStats(ctx context.Context) []QueueStats {
 		delayedKey := fmt.Sprintf("%s:delayed", queue.GetQueueName())
 		delayedSize, _ := d.client.ZCard(ctx, delayedKey).Result()
 
+		// Get scheduled queue size
+		scheduledKey := queue.ScheduledQueueName()
+		scheduledSize, _ := d.client.ZCard(ctx, scheduledKey).Result()
+
 		// Get processing queue size
 		processingKey := queue.GetProcessingKey()
 		processingSize, _ := d.client.ZCard(ctx, processingKey).Result()
@@ -439,6 +452,7 @@ func (d *Dashboard) getQueueStats(ctx context.Context) []QueueStats {
 			Size:           size,
 			QueueName:      queue.GetQueueName(),
 			DelayedSize:    delayedSize,
+			ScheduledSize:  scheduledSize,
 			ProcessingSize: processingSize,
 			DeadLetterSize: deadSize,
 		})
@@ -656,6 +670,143 @@ func (d *Dashboard) handleDelayedAPI(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(delayedJobs)
+}
+
+// handleScheduledAPI handles requests for scheduled jobs.
+// GET /api/scheduled/{jobType} - list scheduled jobs
+func (d *Dashboard) handleScheduledAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job type from URL path
+	jobType := r.URL.Path[len("/api/scheduled/"):]
+	if jobType == "" {
+		http.Error(w, "job type required", http.StatusBadRequest)
+		return
+	}
+
+	queue, ok := d.registry.GetQueue(jobType)
+	if !ok {
+		http.Error(w, "queue not found", http.StatusNotFound)
+		return
+	}
+
+	ctx := r.Context()
+	scheduledKey := queue.ScheduledQueueName()
+	results, err := d.client.ZRangeWithScores(ctx, scheduledKey, 0, 100).Result()
+	if err != nil && err != redis.Nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	type ScheduledJobInfo struct {
+		ID        string                 `json:"id"`
+		Type      string                 `json:"type"`
+		Payload   map[string]interface{} `json:"payload"`
+		Priority  int                    `json:"priority"`
+		StartAt   string                 `json:"start_at"`
+		DelayMs   int64                  `json:"delay_ms"`
+	}
+
+	now := time.Now().UTC()
+	scheduledJobs := make([]ScheduledJobInfo, 0, len(results))
+	for _, z := range results {
+		var job redisqueue.Job
+		if err := json.Unmarshal([]byte(z.Member.(string)), &job); err != nil {
+			continue
+		}
+
+		if job.StartAt == "" {
+			continue
+		}
+
+		executeAt := time.Unix(0, int64(z.Score)).UTC()
+		delayMs := executeAt.Sub(now).Milliseconds()
+		if delayMs < 0 {
+			delayMs = 0
+		}
+
+		var payload map[string]interface{}
+		json.Unmarshal(job.Payload, &payload)
+
+		scheduledJobs = append(scheduledJobs, ScheduledJobInfo{
+			ID:       job.ID,
+			Type:     job.Type,
+			Payload:  payload,
+			Priority: job.Priority,
+			StartAt:  executeAt.Format(time.RFC3339),
+			DelayMs:  delayMs,
+		})
+	}
+
+	sort.Slice(scheduledJobs, func(i, j int) bool {
+		return scheduledJobs[i].StartAt < scheduledJobs[j].StartAt
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(scheduledJobs)
+}
+
+// handleScheduledDeleteAPI handles deleting a scheduled job.
+// DELETE /api/scheduled-delete/{jobType}/{jobID} - remove scheduled job by ID
+func (d *Dashboard) handleScheduledDeleteAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/scheduled-delete/")
+	if path == "" {
+		http.Error(w, "job type and id required", http.StatusBadRequest)
+		return
+	}
+
+	parts := splitPath(path)
+	if len(parts) < 2 {
+		http.Error(w, "job type and id required", http.StatusBadRequest)
+		return
+	}
+
+	jobType := parts[0]
+	jobID := parts[1]
+
+	queue, ok := d.registry.GetQueue(jobType)
+	if !ok {
+		http.Error(w, "queue not found", http.StatusNotFound)
+		return
+	}
+
+	ctx := r.Context()
+	scheduledKey := queue.ScheduledQueueName()
+
+	results, err := d.client.ZRange(ctx, scheduledKey, 0, -1).Result()
+	if err != nil && err != redis.Nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	for _, member := range results {
+		var job redisqueue.Job
+		if err := json.Unmarshal([]byte(member), &job); err != nil {
+			continue
+		}
+		if job.ID == jobID {
+			if err := queue.RemoveFromSet(ctx, scheduledKey, member); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "deleted",
+				"job_id": jobID,
+			})
+			return
+		}
+	}
+
+	http.Error(w, "job not found", http.StatusNotFound)
 }
 
 // handleProcessingAPI handles requests for processing queue.
