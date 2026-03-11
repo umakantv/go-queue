@@ -114,11 +114,11 @@
         .stat-item .count.processing {
             color: #4facfe;
         }
-        .stat-item .count.scheduled {
-            color: #9b59b6;
-        }
         .stat-item .count.dead {
             color: #f5576c;
+        }
+        .stat-item .count.scheduled {
+            color: #9b59b6;
         }
         .stat-item .label {
             color: #888;
@@ -223,6 +223,10 @@
             border-left-color: #f5a623;
             background: #fffdf0;
         }
+        .job-item.scheduled {
+            border-left-color: #9b59b6;
+            background: #faf0ff;
+        }
         .job-header {
             display: flex;
             justify-content: space-between;
@@ -240,6 +244,9 @@
         }
         .job-item.delayed .job-id {
             color: #f5a623;
+        }
+        .job-item.scheduled .job-id {
+            color: #9b59b6;
         }
         .job-actions {
             display: flex;
@@ -341,12 +348,12 @@
                         <div class="label">Pending</div>
                     </div>
                     <div class="stat-item">
-                        <div class="count delayed" id="delayed-{{.Name}}">{{.DelayedSize}}</div>
-                        <div class="label">Delayed</div>
-                    </div>
-                    <div class="stat-item">
                         <div class="count scheduled" id="scheduled-{{.Name}}">{{.ScheduledSize}}</div>
                         <div class="label">Scheduled</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="count delayed" id="delayed-{{.Name}}">{{.DelayedSize}}</div>
+                        <div class="label">Retry</div>
                     </div>
                     <div class="stat-item">
                         <div class="count processing" id="processing-{{.Name}}">{{.ProcessingSize}}</div>
@@ -374,7 +381,7 @@
             <div class="tabs" id="jobsTabs">
                 <button class="tab-btn active" data-tab="pending" onclick="switchTab('pending')">📥 Pending</button>
                 <button class="tab-btn" data-tab="scheduled" onclick="switchTab('scheduled')">📅 Scheduled</button>
-                <button class="tab-btn" data-tab="delayed" onclick="switchTab('delayed')">⏱️ Delayed</button>
+                <button class="tab-btn" data-tab="delayed" onclick="switchTab('delayed')">🔄 Retry</button>
                 <button class="tab-btn" data-tab="processing" onclick="switchTab('processing')">⚙️ Processing</button>
                 <button class="tab-btn" data-tab="dead" onclick="switchTab('dead')">💀 Dead Letter</button>
             </div>
@@ -425,8 +432,8 @@
         function updateQueues(queues) {
             queues.forEach(queue => {
                 const sizeEl = document.getElementById(`size-${queue.name}`);
-                const delayedEl = document.getElementById(`delayed-${queue.name}`);
                 const scheduledEl = document.getElementById(`scheduled-${queue.name}`);
+                const delayedEl = document.getElementById(`delayed-${queue.name}`);
                 const processingEl = document.getElementById(`processing-${queue.name}`);
                 const deadEl = document.getElementById(`dead-${queue.name}`);
                 
@@ -438,11 +445,11 @@
                     }
                     sizeEl.textContent = queue.size;
                 }
-                if (delayedEl) {
-                    delayedEl.textContent = queue.delayed_size;
-                }
                 if (scheduledEl) {
                     scheduledEl.textContent = queue.scheduled_size;
+                }
+                if (delayedEl) {
+                    delayedEl.textContent = queue.delayed_size;
                 }
                 if (processingEl) {
                     processingEl.textContent = queue.processing_size;
@@ -453,8 +460,8 @@
                 
                 previousStats[queue.name] = {
                     size: queue.size,
-                    delayed: queue.delayed_size,
                     scheduled: queue.scheduled_size,
+                    delayed: queue.delayed_size,
                     processing: queue.processing_size,
                     dead: queue.dead_letter_size
                 };
@@ -476,6 +483,59 @@
             if (selectedQueue) {
                 fetchJobs(selectedQueue, tab);
             }
+        }
+
+        function formatDateTime(value) {
+            if (!value) {
+                return 'unknown';
+            }
+            const date = value instanceof Date ? value : new Date(value);
+            if (Number.isNaN(date.getTime())) {
+                return 'invalid date';
+            }
+            return date.toLocaleString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        function formatDuration(ms) {
+            if (!Number.isFinite(ms)) {
+                return '';
+            }
+            const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            const seconds = totalSeconds % 60;
+
+            const parts = [];
+            if (hours > 0) {
+                parts.push(`${hours}h`);
+            }
+            if (minutes > 0) {
+                parts.push(`${minutes}m`);
+            }
+            if ((hours === 0 && minutes === 0) || (seconds > 0 && hours === 0)) {
+                parts.push(`${seconds}s`);
+            }
+            return parts.join(' ');
+        }
+
+        function formatDelayText(value) {
+            if (!value) {
+                return '';
+            }
+            const date = value instanceof Date ? value : new Date(value);
+            if (Number.isNaN(date.getTime())) {
+                return '';
+            }
+            const now = new Date();
+            const deltaMs = Math.abs(date.getTime() - now.getTime());
+            return formatDuration(deltaMs);
         }
 
         async function fetchJobs(queueName, tab) {
@@ -507,10 +567,25 @@
                 const jobsList = document.getElementById(listId);
                 
                 if (jobs.length === 0) {
+                    let emptyIcon = '📭';
+                    let emptyText = 'No pending jobs';
+                    if (tab === 'scheduled') {
+                        emptyIcon = '📅';
+                        emptyText = 'No scheduled jobs';
+                    } else if (tab === 'dead') {
+                        emptyIcon = '🪦';
+                        emptyText = 'No dead jobs';
+                    } else if (tab === 'processing') {
+                        emptyIcon = '⚙️';
+                        emptyText = 'No jobs currently processing';
+                    } else if (tab === 'delayed') {
+                        emptyIcon = '🔄';
+                        emptyText = 'No retry jobs';
+                    }
                     jobsList.innerHTML = `
                         <div class="empty-state">
-                            <div class="empty-state-icon">${tab === 'dead' ? '🪦' : tab === 'processing' ? '⚙️' : tab === 'scheduled' ? '📅' : '📭'}</div>
-                            <div>${tab === 'pending' ? 'No pending jobs' : tab === 'scheduled' ? 'No scheduled jobs' : tab === 'delayed' ? 'No delayed jobs' : tab === 'processing' ? 'No jobs currently processing' : 'No dead jobs'}</div>
+                            <div class="empty-state-icon">${emptyIcon}</div>
+                            <div>${emptyText}</div>
                         </div>
                     `;
                     return;
@@ -550,29 +625,32 @@
         }
 
         function renderScheduledJob(job) {
-            const executeAt = job.start_at || 'pending';
+            const executeAtValue = job.execute_at || job.start_at;
+            const executeAt = executeAtValue ? formatDateTime(executeAtValue) : 'pending';
+            const delay = executeAtValue ? formatDelayText(executeAtValue) : '';
+            const delayText = delay ? ` (${delay})` : '';
             const priority = job.priority || 3;
-            const delayMs = job.delay_ms || 0;
-            const formattedTime = formatDateTime(executeAt);
             return `
-                <div class="job-item delayed">
+                <div class="job-item scheduled">
                     <div class="job-header">
-                        <div class="job-id">ID: ${job.id}<span class="delayed-badge">Scheduled</span></div>
+                        <div class="job-id">ID: ${job.id}<span class="delayed-badge" style="background: #9b59b6;">Scheduled</span></div>
                         <div class="job-actions">
-                            <span class="delayed-badge" style="background: #667eea; margin-right: 8px;">Priority ${priority}</span>
-                            <button class="btn btn-danger btn-small" onclick="deleteScheduledJob('${job.id}')">🗑️ Delete</button>
+                            <span class="delayed-badge" style="background: #667eea;">Priority ${priority}</span>
                         </div>
                     </div>
                     <div class="job-payload">${JSON.stringify(job.payload, null, 2)}</div>
-                    <div class="job-meta">📅 Starts at: ${formattedTime} (in ${formatDelay(delayMs)})</div>
+                    <div class="job-meta">📅 Starts at: ${executeAt}${delayText}</div>
+                    <div class="job-actions" style="margin-top: 10px;">
+                        <button class="btn btn-danger btn-small" onclick="deleteScheduledJob('${job.id}')">🗑️ Delete</button>
+                    </div>
                 </div>
             `;
         }
 
         function renderDelayedJob(job) {
-            const executeAt = job.execute_at || 'pending';
+            const executeAtValue = job.execute_at;
+            const executeAt = executeAtValue ? formatDateTime(executeAtValue) : 'pending';
             const priority = job.priority || 3;
-            const formattedTime = formatDateTime(executeAt);
             return `
                 <div class="job-item delayed">
                     <div class="job-header">
@@ -582,46 +660,17 @@
                         </div>
                     </div>
                     <div class="job-payload">${JSON.stringify(job.payload, null, 2)}</div>
-                    <div class="job-meta">⏱️ Executes at: ${formattedTime}</div>
+                    <div class="job-meta">⏱️ Executes at: ${executeAt}</div>
                 </div>
             `;
         }
 
-        function formatDelay(ms) {
-            const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-            const hours = Math.floor(totalSeconds / 3600);
-            const minutes = Math.floor((totalSeconds % 3600) / 60);
-            const seconds = totalSeconds % 60;
-            const parts = [];
-            if (hours) parts.push(`${hours}h`);
-            if (minutes) parts.push(`${minutes}m`);
-            if (seconds || parts.length === 0) parts.push(`${seconds}s`);
-            return parts.join(' ');
-        }
-
-        function formatDateTime(value) {
-            if (!value || value === 'pending') {
-                return 'pending';
-            }
-            const date = new Date(value);
-            if (isNaN(date.getTime())) {
-                return value;
-            }
-            const year = date.getFullYear();
-            const month = String(date.getMonth() + 1).padStart(2, '0');
-            const day = String(date.getDate()).padStart(2, '0');
-            const hours = String(date.getHours()).padStart(2, '0');
-            const minutes = String(date.getMinutes()).padStart(2, '0');
-            const seconds = String(date.getSeconds()).padStart(2, '0');
-            return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-        }
-
         function renderProcessingJob(job) {
-            const visibleAt = job.visible_at || 'unknown';
-            const pickedUpAt = job.picked_up_at || 'unknown';
+            const visibleAtValue = job.visible_at;
+            const pickedUpValue = job.picked_up_at;
+            const visibleAt = visibleAtValue ? formatDateTime(visibleAtValue) : 'unknown';
+            const pickedUpAt = pickedUpValue ? formatDateTime(pickedUpValue) : 'unknown';
             const priority = job.priority || 3;
-            const formattedVisibleAt = formatDateTime(visibleAt);
-            const formattedPickedUpAt = formatDateTime(pickedUpAt);
             return `
                 <div class="job-item" style="border-left-color: #4facfe; background: #f0f9ff;">
                     <div class="job-header">
@@ -632,8 +681,8 @@
                     </div>
                     <div class="job-payload">${JSON.stringify(job.payload, null, 2)}</div>
                     <div class="job-meta">
-                        <div>⚙️ Visibility timeout expires at: ${formattedVisibleAt}</div>
-                        <div style="margin-top: 4px;">🚚 Picked up at: ${formattedPickedUpAt}</div>
+                        <div>⚙️ Visibility timeout expires at: ${visibleAt}</div>
+                        <div style="margin-top: 4px;">🚚 Picked up at: ${pickedUpAt}</div>
                         <div style="margin-top: 4px;">🔄 Current retry count: ${job.retry_count || 0}</div>
                     </div>
                 </div>
@@ -646,37 +695,6 @@
                     <button class="btn btn-danger" onclick="clearDeadLetter()">🗑️ Clear All Dead Jobs</button>
                 </div>
             `;
-        }
-
-        async function deleteScheduledJob(jobId) {
-            if (!selectedQueue) {
-                return;
-            }
-
-            const confirmed = confirm('Delete this scheduled job?');
-            if (!confirmed) {
-                return;
-            }
-
-            try {
-                const response = await fetch(`/api/scheduled-delete/${selectedQueue}/${jobId}`, {
-                    method: 'DELETE'
-                });
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    alert(`Failed to delete scheduled job: ${errorText}`);
-                    return;
-                }
-
-                await response.json();
-                if (currentTab === 'scheduled') {
-                    fetchJobs(selectedQueue, 'scheduled');
-                }
-            } catch (error) {
-                console.error('Failed to delete scheduled job:', error);
-                alert('Failed to delete scheduled job');
-            }
         }
 
         function renderDeadJob(job) {
@@ -743,6 +761,28 @@
                 } else {
                     const error = await response.text();
                     alert('Failed to clear: ' + error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+
+        async function deleteScheduledJob(jobId) {
+            if (!confirm(`Delete scheduled job ${jobId}? This cannot be undone.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/scheduled/${selectedQueue}/${jobId}`, {
+                    method: 'DELETE'
+                });
+
+                if (response.ok) {
+                    alert('Scheduled job deleted!');
+                    fetchJobs(selectedQueue, currentTab);
+                } else {
+                    const error = await response.text();
+                    alert('Failed to delete scheduled job: ' + error);
                 }
             } catch (error) {
                 alert('Error: ' + error.message);
