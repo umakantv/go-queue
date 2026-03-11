@@ -58,9 +58,9 @@ func (r *Registry) RegisterFunc(jobType string, queueName string, handler Handle
 	return r.Register(jobType, queueName, handler)
 }
 
-// Enqueue adds a new job to the queue for its registered job type with optional max retries and priority.
+// Enqueue adds a new job to the queue for its registered job type with optional max retries, priority, and start time.
 // Priority defaults to DefaultPriority (3) if set to 0 or negative. Lower numbers = higher priority.
-// startAt is an optional scheduled execution time in RFC3339 format; if empty, the job is processed immediately.
+// startAt is an optional scheduled execution time in RFC3339 format (empty string for immediate execution).
 func (r *Registry) Enqueue(ctx context.Context, jobType string, payload any, maxRetries int, priority int, startAt string) (*Job, error) {
 	r.mu.RLock()
 	queue, exists := r.queues[jobType]

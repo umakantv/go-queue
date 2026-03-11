@@ -78,6 +78,16 @@ func (q *RedisQueue) GetProcessingKey() string {
 	return fmt.Sprintf("%s:processing", q.queueName)
 }
 
+// GetDelayedKey returns the key for the delayed (retry) sorted set.
+func (q *RedisQueue) GetDelayedKey() string {
+	return fmt.Sprintf("%s:delayed", q.queueName)
+}
+
+// GetScheduledKey returns the key for the scheduled sorted set.
+func (q *RedisQueue) GetScheduledKey() string {
+	return fmt.Sprintf("%s:scheduled", q.queueName)
+}
+
 
 // DequeueWithTimeout removes and returns a value from the front of the queue.
 // It blocks until a value is available, the timeout is reached, or the context is cancelled.

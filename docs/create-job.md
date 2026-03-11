@@ -20,8 +20,6 @@ Content-Type: application/json
 {
   "queue": "<job_type>",
   "id": "<optional_custom_id>",
-  "priority": "<optional_priority>",
-  "max_retries": "<optional_max_retries>",
   "start_at": "<optional_scheduled_time>",
   "payload": { ... }
 }
@@ -31,11 +29,11 @@ Content-Type: application/json
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `queue` | string | Yes | The queue name (job type): `email` or `download` |
+| `queue` | string | Yes | The queue name (job type): `email`, `download`, or `prepare-report` |
 | `id` | string | No | Custom job ID (auto-generated if omitted) |
-| `priority` | integer | No | Job priority - lower is higher (default: 3) |
 | `max_retries` | integer | No | Maximum number of retries (default: 0) |
-| `start_at` | string | No | Scheduled execution time in RFC3339 format |
+| `priority` | integer | No | Job priority - lower is higher (default: 3) |
+| `start_at` | string | No | Scheduled execution time in RFC3339 format (empty = immediate) |
 | `payload` | object | Yes | Job payload data |
 
 ## Success Response
@@ -48,7 +46,7 @@ Content-Type: application/json
   "type": "email",
   "queue": "queue:email",
   "priority": 3,
-  "start_at": "2024-12-25T09:00:00Z",
+  "start_at": "2024-03-15T14:30:00Z",
   "payload": {
     "to": "user@example.com",
     "subject": "Welcome",
@@ -136,111 +134,6 @@ curl -X POST http://localhost:8080/api/jobs \
   }'
 ```
 
-## Scheduled Jobs
-
-Jobs can be scheduled for future execution by specifying a `start_at` timestamp in RFC3339 format. The job will be held in a delayed queue until the scheduled time, then promoted to the main queue for processing.
-
-### Create a Scheduled Email Job
-
-```bash
-# Schedule an email to be sent at a specific time
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "queue": "email",
-    "start_at": "2024-12-25T09:00:00Z",
-    "payload": {
-      "to": "user@example.com",
-      "subject": "Holiday Greeting",
-      "body": "Happy Holidays!"
-    }
-  }'
-```
-
-### Create a Scheduled Job with Priority and Retries
-
-```bash
-# Schedule a high-priority job with retry support
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "queue": "email",
-    "priority": 1,
-    "max_retries": 3,
-    "start_at": "2024-01-15T14:30:00Z",
-    "payload": {
-      "to": "important@example.com",
-      "subject": "Scheduled Report",
-      "body": "This is a scheduled high-priority email"
-    }
-  }'
-```
-
-### Create a Scheduled Report Job
-
-```bash
-# Schedule a report generation for off-peak hours
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "queue": "prepare-report",
-    "start_at": "2024-01-16T02:00:00Z",
-    "payload": {
-      "report_type": "daily_summary",
-      "start_date": "2024-01-15",
-      "end_date": "2024-01-15"
-    }
-  }'
-```
-
-### Calculate Future Timestamp
-
-You can use shell commands to calculate a future timestamp:
-
-```bash
-# Schedule a job for 30 minutes from now
-START_AT=$(date -u -d "+30 minutes" +"%Y-%m-%dT%H:%M:%SZ")
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"queue\": \"email\",
-    \"start_at\": \"$START_AT\",
-    \"payload\": {
-      \"to\": \"user@example.com\",
-      \"subject\": \"Reminder\",
-      \"body\": \"This is a reminder email\"
-    }
-  }"
-
-# Schedule a job for tomorrow at 9 AM UTC
-START_AT=$(date -u -d "tomorrow 09:00" +"%Y-%m-%dT%H:%M:%SZ")
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"queue\": \"email\",
-    \"start_at\": \"$START_AT\",
-    \"payload\": {
-      \"to\": \"user@example.com\",
-      \"subject\": \"Daily Report\",
-      \"body\": \"Here is your daily report\"
-    }
-  }"
-```
-
-### How Scheduled Jobs Work
-
-1. When a job with `start_at` is created, it's placed in the delayed queue with the timestamp as the score
-2. The broker's promoter goroutine periodically checks the delayed queue
-3. When `start_at` time is reached, the job is promoted to the main queue
-4. Workers pick up the job from the main queue and process it normally
-
-### Verify Scheduled Jobs
-
-Check delayed jobs for a queue:
-```bash
-curl http://localhost:8080/api/delayed/email
-```
-
 ### Create Multiple Jobs
 
 ```bash
@@ -256,6 +149,183 @@ for i in {1..5}; do
       }
     }"
 done
+```
+
+## Scheduled Jobs
+
+Jobs can be scheduled for future execution by specifying a `start_at` timestamp in RFC3339 format.
+
+### Create a Scheduled Email Job
+
+```bash
+# Schedule an email to be sent at a specific time
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-03-15T14:30:00Z",
+    "payload": {
+      "to": "scheduled@example.com",
+      "subject": "Scheduled Report",
+      "body": "This email was scheduled for later delivery."
+    }
+  }'
+```
+
+### Create a Scheduled Job with Priority and Retries
+
+```bash
+# Schedule a high-priority job with retries
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-03-15T09:00:00Z",
+    "priority": 1,
+    "max_retries": 3,
+    "payload": {
+      "to": "important@example.com",
+      "subject": "Important Scheduled Notification",
+      "body": "This is a high-priority scheduled message."
+    }
+  }'
+```
+
+### Create a Scheduled Download Job
+
+```bash
+# Schedule a download for off-peak hours
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "download",
+    "start_at": "2024-03-15T02:00:00Z",
+    "payload": {
+      "url": "https://example.com/large-file.zip",
+      "filename": "large-file.zip"
+    }
+  }'
+```
+
+### Create a Scheduled Report Job
+
+```bash
+# Schedule a report generation for early morning
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "prepare-report",
+    "start_at": "2024-03-16T06:00:00Z",
+    "payload": {
+      "report_type": "daily_summary",
+      "start_date": "2024-03-15",
+      "end_date": "2024-03-15"
+    }
+  }'
+```
+
+### Schedule Multiple Jobs at Different Times
+
+```bash
+# Schedule emails at different times
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-03-15T09:00:00Z",
+    "payload": {
+      "to": "morning@example.com",
+      "subject": "Morning Report",
+      "body": "Good morning! Here is your daily report."
+    }
+  }'
+
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-03-15T12:00:00Z",
+    "payload": {
+      "to": "noon@example.com",
+      "subject": "Lunch Reminder",
+      "body": "Time for lunch!"
+    }
+  }'
+
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-03-15T18:00:00Z",
+    "payload": {
+      "to": "evening@example.com",
+      "subject": "Evening Summary",
+      "body": "Here is your evening summary."
+    }
+  }'
+```
+
+### start_at Format
+
+The `start_at` field accepts timestamps in RFC3339 format:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| UTC | `2024-03-15T14:30:00Z` | UTC timezone |
+| With offset | `2024-03-15T14:30:00-05:00` | Eastern Standard Time |
+| With offset | `2024-03-15T14:30:00+01:00` | Central European Time |
+
+If `start_at` is empty or not provided, the job is enqueued immediately for processing.
+
+## Using the Producer with Delay
+
+The producer script supports a `-delay` flag for creating scheduled jobs without manually calculating timestamps.
+
+### Delay Format
+
+The `-delay` flag accepts duration strings in Go's time.Duration format:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| Seconds | `30s` | 30 seconds delay |
+| Minutes | `5m` | 5 minutes delay |
+| Hours | `2h` | 2 hours delay |
+| Combined | `1h30m` | 1 hour 30 minutes delay |
+| Combined | `2h45m30s` | 2 hours 45 minutes 30 seconds delay |
+
+### Producer Examples with Delay
+
+```bash
+# Create an email job that will execute in 5 minutes
+go run ./cmd/producer -type email -count 1 -delay 5m
+
+# Create a download job that will execute in 2 hours
+go run ./cmd/producer -type download -count 1 -delay 2h
+
+# Create a job with combined delay (1 hour 30 minutes)
+go run ./cmd/producer -type email -count 1 -delay 1h30m
+
+# Create multiple scheduled jobs with priority and retries
+go run ./cmd/producer -type email -count 3 -delay 10m -priority 1 -max-retries 3
+
+# Create a report job scheduled for 30 minutes from now
+go run ./cmd/producer -type prepare-report -count 1 -delay 30m
+
+# Create a download job scheduled for off-peak hours (e.g., 4 hours from now)
+go run ./cmd/producer -type download -count 1 -delay 4h
+```
+
+### Combining Delay with Other Options
+
+```bash
+# High-priority scheduled job with retries
+go run ./cmd/producer -type email -count 1 -priority 1 -max-retries 3 -delay 1h
+
+# Multiple low-priority scheduled downloads
+go run ./cmd/producer -type download -count 5 -priority 5 -delay 2h30m
+
+# Scheduled report generation with retries
+go run ./cmd/producer -type prepare-report -count 2 -max-retries 2 -delay 6h
 ```
 
 ## Error Responses

@@ -75,9 +75,9 @@ go get github.com/umakantv/redis-queue
    # Create low-priority jobs (priority 5 = lower than default)
    go run ./cmd/producer -type download -count 5 -priority 5
    
-   # Schedule jobs with a delay
-   go run ./cmd/producer -type email -count 2 -delay 30s
-   go run ./cmd/producer -type prepare-report -count 1 -delay 2h3m10s
+   # Create scheduled jobs with delay
+   go run ./cmd/producer -type email -count 2 -delay 5m
+   go run ./cmd/producer -type download -count 1 -delay 2h30m
    
    # List pending jobs
    go run ./cmd/producer -list
@@ -97,6 +97,44 @@ Workers support the following command-line flags:
 Example:
 ```bash
 go run ./cmd/email -concurrency 4 -retry-delay 2s
+```
+
+## Producer Configuration
+
+The producer script supports the following command-line flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-type` | (required) | Job type: `email`, `download`, or `prepare-report` |
+| `-count` | 1 | Number of jobs to create |
+| `-max-retries` | 0 | Maximum number of retries for failed jobs |
+| `-priority` | 3 | Job priority (lower = higher priority) |
+| `-delay` | "" | Delay before job execution (e.g., `30s`, `5m`, `2h`, `1h30m`) |
+| `-list` | false | List pending jobs in queues |
+| `-server` | `http://localhost:8080` | Dashboard server URL |
+
+### Delay Format
+
+The `-delay` flag accepts duration strings in Go's time.Duration format:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| Seconds | `30s` | 30 seconds delay |
+| Minutes | `5m` | 5 minutes delay |
+| Hours | `2h` | 2 hours delay |
+| Combined | `1h30m` | 1 hour 30 minutes delay |
+| Combined | `2h45m30s` | 2 hours 45 minutes 30 seconds delay |
+
+Example:
+```bash
+# Create a job that will execute in 5 minutes
+go run ./cmd/producer -type email -count 1 -delay 5m
+
+# Create a job that will execute in 2 hours and 30 minutes
+go run ./cmd/producer -type download -count 1 -delay 2h30m
+
+# Create a high-priority scheduled job with retries
+go run ./cmd/producer -type email -count 1 -priority 1 -max-retries 3 -delay 1h
 ```
 
 ## Job Priorities
@@ -139,77 +177,6 @@ go run ./cmd/producer -type email -count 5 -priority 1
 go run ./cmd/producer -type download -count 3 -priority 5
 ```
 
-## Scheduled Jobs
-
-Jobs can be scheduled for future execution by specifying a `start_at` timestamp in RFC3339 format. The job will be held in a delayed queue until the scheduled time, then promoted to the main queue for processing.
-
-### Scheduling via API
-
-When creating a job via the REST API, include the `start_at` field:
-
-```bash
-# Schedule an email job to run at a specific time
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "queue": "email",
-    "start_at": "2024-12-25T09:00:00Z",
-    "payload": {
-      "to": "user@example.com",
-      "subject": "Holiday Greeting",
-      "body": "Happy Holidays!"
-    }
-  }'
-
-# Schedule a report job to run in 30 minutes
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "queue": "prepare-report",
-    "start_at": "2024-01-15T14:30:00Z",
-    "payload": {
-      "report_type": "daily_summary",
-      "start_date": "2024-01-14",
-      "end_date": "2024-01-14"
-    }
-  }'
-```
-
-### Scheduling Programmatically
-
-When creating jobs programmatically:
-
-```go
-import redisqueue "github.com/umakantv/redis-queue/redisqueue"
-
-// Schedule a job for future execution
-scheduledTime := "2024-12-25T09:00:00Z"
-job, err := registry.Enqueue(ctx, "email", payload, 3, 1, scheduledTime)
-// maxRetries=3, priority=1, startAt=scheduledTime
-
-// Create an immediate job (empty startAt)
-job, err := registry.Enqueue(ctx, "email", payload, 3, 0, "")
-```
-
-### Scheduling via Producer
-
-Use the `-delay` flag with Go duration syntax (`30s`, `5m`, `2h3m10s`):
-
-```bash
-# Schedule an email job for 1 minute later
-go run ./cmd/producer -type email -count 1 -delay 1m
-
-# Schedule a report job for 2 hours and 3 minutes later
-go run ./cmd/producer -type prepare-report -count 1 -delay 2h3m
-```
-
-### How Scheduled Jobs Work
-
-1. When a job with `start_at` is created, it's placed in the delayed queue with the timestamp as the score
-2. The broker's promoter goroutine periodically checks the delayed queue
-3. When `start_at` time is reached, the job is promoted to the main queue
-4. Workers pick up the job from the main queue and process it normally
-
 ### Priority in Job Structure
 
 When creating jobs programmatically:
@@ -223,6 +190,57 @@ job, err := registry.Enqueue(ctx, "email", payload, 3, 1, "") // maxRetries=3, p
 // Create a job with default priority
 job, err := registry.Enqueue(ctx, "email", payload, 3, 0, "") // 0 uses default (3)
 ```
+
+## Scheduled Jobs
+
+Jobs can be scheduled for future execution by specifying a `start_at` timestamp in RFC3339 format. The job will be held in the delayed queue until the specified time, then promoted to the main queue for processing.
+
+### Setting Schedule via API
+
+When creating a job via the REST API, include the `start_at` field:
+
+```bash
+# Schedule an email job to run in 5 minutes
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "email",
+    "start_at": "2024-03-15T14:30:00Z",
+    "payload": {
+      "to": "scheduled@example.com",
+      "subject": "Scheduled Report",
+      "body": "This email was scheduled for later delivery."
+    }
+  }'
+```
+
+### Setting Schedule Programmatically
+
+```go
+import redisqueue "github.com/umakantv/redis-queue/redisqueue"
+
+// Schedule a job for a specific time
+scheduledTime := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+job, err := registry.Enqueue(ctx, "email", payload, 3, 1, scheduledTime)
+
+// Create an immediate job (no scheduling)
+job, err := registry.Enqueue(ctx, "email", payload, 3, 1, "")
+```
+
+### How Scheduled Jobs Work
+
+1. When a job is created with `start_at`, it is placed in the delayed queue (sorted set) with the timestamp as the score
+2. The broker process continuously checks the delayed queue for jobs ready to be processed
+3. When the current time exceeds the `start_at` timestamp, the job is promoted to the main queue
+4. Workers then pick up the job from the main queue and process it normally
+
+### start_at Format
+
+The `start_at` field accepts timestamps in RFC3339 format:
+- `2024-03-15T14:30:00Z` (UTC)
+- `2024-03-15T14:30:00-05:00` (with timezone offset)
+
+If `start_at` is empty or not provided, the job is enqueued immediately.
 
 ## Queue Architecture
 
@@ -297,12 +315,13 @@ Jobs that fail after reaching the maximum retry count are moved to the dead-lett
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Web dashboard UI |
-| `/api/queues` | GET | List all queues with stats (pending, delayed, dead) |
+| `/api/queues` | GET | List all queues with stats (pending, delayed, scheduled, dead) |
 | `/api/queue/{type}` | GET | Get pending jobs for a specific queue |
 | `/api/jobs` | POST | Create a new job |
-| `/api/delayed/{type}` | GET | List delayed retry jobs with execution times |
-| `/api/scheduled/{type}` | GET | List scheduled jobs with start times |
-| `/api/scheduled-delete/{type}/{id}` | DELETE | Delete a scheduled job |
+| `/api/delayed/{type}` | GET | List delayed (retry) jobs with execution times |
+| `/api/scheduled/{type}` | GET | List scheduled jobs with execution times |
+| `/api/scheduled/{type}/{id}` | DELETE | Delete a scheduled job |
+| `/api/processing/{type}` | GET | List jobs currently being processed |
 | `/api/dead-letter/{type}` | GET | List dead-letter jobs with error history |
 | `/api/dead-letter/{type}` | DELETE | Clear all dead-letter jobs |
 | `/api/replay-job/{type}/{id}` | POST | Replay a dead-letter job |
@@ -334,7 +353,7 @@ Create a new job and insert it into the specified queue.
 | `id` | string | No | Custom job ID (auto-generated if omitted) |
 | `max_retries` | integer | No | Maximum number of retries (default: 0) |
 | `priority` | integer | No | Job priority - lower is higher (default: 3) |
-| `start_at` | string | No | Scheduled execution time in RFC3339 format (e.g., `2024-12-25T09:00:00Z`) |
+| `start_at` | string | No | Scheduled execution time in RFC3339 format (empty = immediate) |
 | `payload` | object | Yes | Job payload data |
 
 
@@ -345,7 +364,7 @@ Create a new job and insert it into the specified queue.
   "type": "email",
   "queue": "queue:email",
   "priority": 3,
-  "start_at": "2024-12-25T09:00:00Z",
+  "start_at": "2024-03-15T14:30:00Z",
   "payload": {
     "to": "user@example.com",
     "subject": "Hello",
@@ -382,16 +401,16 @@ curl -X POST http://localhost:8080/api/jobs \
     }
   }'
 
-# Create a scheduled job
+# Create a scheduled job to run at a specific time
 curl -X POST http://localhost:8080/api/jobs \
   -H "Content-Type: application/json" \
   -d '{
     "queue": "email",
-    "start_at": "2024-12-25T09:00:00Z",
+    "start_at": "2024-03-15T14:30:00Z",
     "payload": {
-      "to": "user@example.com",
-      "subject": "Scheduled Message",
-      "body": "This will be sent at the scheduled time"
+      "to": "scheduled@example.com",
+      "subject": "Scheduled Report",
+      "body": "This email was scheduled for later delivery."
     }
   }'
 
@@ -409,6 +428,48 @@ curl -X POST http://localhost:8080/api/jobs \
 
 See [docs/create-job.md](docs/create-job.md) for more examples.
 
+### Scheduled Jobs API
+
+**GET /api/scheduled/{type}**
+
+List scheduled jobs waiting for their execution time.
+
+**Response:**
+```json
+[
+  {
+    "id": "job-123",
+    "type": "email",
+    "payload": {
+      "to": "scheduled@example.com",
+      "subject": "Scheduled Report",
+      "body": "This is a scheduled message"
+    },
+    "priority": 3,
+    "start_at": "2024-03-15T14:30:00Z",
+    "execute_at": "2024-03-15T14:30:00Z"
+  }
+]
+```
+
+**Example Usage:**
+```bash
+# List scheduled email jobs
+curl http://localhost:8080/api/scheduled/email
+
+# List scheduled download jobs
+curl http://localhost:8080/api/scheduled/download
+```
+
+**DELETE /api/scheduled/{type}/{id}**
+
+Delete a scheduled job by ID.
+
+**Example Usage:**
+```bash
+curl -X DELETE http://localhost:8080/api/scheduled/email/job-123
+```
+
 ### Replay Job API
 
 **POST /api/replay-job/{type}/{id}**
@@ -423,10 +484,11 @@ curl -X POST http://localhost:8080/api/replay-job/email/abc123
 
 The web dashboard provides:
 
-- **Queue Cards**: Shows pending, delayed, and dead-letter counts for each queue
+- **Queue Cards**: Shows pending, delayed, scheduled, and dead-letter counts for each queue
 - **Tabbed Job Views**:
   - **Pending**: Active jobs waiting to be processed
-  - **Delayed**: Jobs waiting for retry with execution times
+  - **Delayed**: Retry jobs waiting for execution with retry times
+  - **Scheduled**: Jobs scheduled for future execution
   - **Dead Letter**: Failed jobs with expandable error history
 - **Actions**:
   - Clear all dead-letter jobs

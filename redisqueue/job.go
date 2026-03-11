@@ -35,7 +35,7 @@ const DefaultPriority = 3
 
 // NewJob creates a new Job with a unique ID and optional max retries.
 // Priority defaults to DefaultPriority (3) if not specified or invalid.
-// startAt is an optional scheduled execution time in RFC3339 format; if empty, the job is processed immediately.
+// startAt is an optional scheduled execution time in RFC3339 format (empty string for immediate execution).
 func NewJob(jobType string, payload any, maxRetries int, priority int, startAt string) (*Job, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -106,24 +106,26 @@ func NewJobQueue(client *RedisQueue, jobType string, handler Handler) *JobQueue 
 }
 
 // EnqueueJob serializes and adds a job to the queue with its priority.
-// If job.StartAt is set to a future time, it is placed into the scheduled queue instead.
+// If the job has a StartAt time set, it is added to the scheduled queue instead.
 func (q *JobQueue) EnqueueJob(ctx context.Context, job *Job) error {
 	jobBytes, err := json.Marshal(job)
 	if err != nil {
 		return fmt.Errorf("failed to marshal job: %w", err)
 	}
 
+	// If job has a scheduled start time, put it in the scheduled queue
 	if job.StartAt != "" {
-		executeAt, err := time.Parse(time.RFC3339, job.StartAt)
+		scheduledTime, err := time.Parse(time.RFC3339, job.StartAt)
 		if err != nil {
-			return fmt.Errorf("invalid start_at value: %w", err)
+			return fmt.Errorf("invalid start_at format: %w", err)
 		}
-
-		if executeAt.After(time.Now().UTC()) {
-			return q.AddToSet(ctx, q.ScheduledQueueName(), float64(executeAt.UnixNano()), string(jobBytes))
-		}
+		// Use UnixNano as the score for the scheduled queue
+		score := float64(scheduledTime.UnixNano())
+		scheduledKey := q.GetScheduledKey()
+		return q.AddToSet(ctx, scheduledKey, score, string(jobBytes))
 	}
 
+	// No start time, enqueue immediately
 	return q.Enqueue(ctx, string(jobBytes), job.Priority)
 }
 
@@ -231,14 +233,4 @@ func (q *JobQueue) GetJobType() string {
 // GetHandler returns the handler for this queue.
 func (q *JobQueue) GetHandler() Handler {
 	return q.handler
-}
-
-// DelayedQueueName returns the delayed retry queue key for this job type.
-func (q *JobQueue) DelayedQueueName() string {
-	return fmt.Sprintf("%s:delayed", q.GetQueueName())
-}
-
-// ScheduledQueueName returns the scheduled queue key for this job type.
-func (q *JobQueue) ScheduledQueueName() string {
-	return fmt.Sprintf("%s:scheduled", q.GetQueueName())
 }
